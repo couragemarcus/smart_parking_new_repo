@@ -177,7 +177,7 @@ export function getSecurityLot(token?: string) {
 
 export type LiveBay = { id: string; physical_state: 'UNKNOWN' | 'FREE' | 'OCCUPIED'; last_seen: string | null; sensor_updated_at: string | null; display_state: 'WAITING_FOR_SENSOR' | 'AVAILABLE' | 'OCCUPIED' | 'ASSIGNED'; assigned: number }
 export function getLiveBays() { return request<{ site_id: string; bays: LiveBay[] }>('/api/bays') }
-export function getFacilityConfig() { return request<{ site_id: string; latitude: number; longitude: number }>('/api/public/facility-config') }
+export function getFacilityConfig() { return request<{ site_id: string; latitude: number | null; longitude: number | null }>('/api/public/facility-config') }
 export function assignLiveBay(spaceId: string, assigned: boolean, token?: string) {
   return request<LiveBay>(`/api/v1/security/bays/${encodeURIComponent(spaceId)}/assignment`, { method: 'POST', headers: adminHeaders(token), body: JSON.stringify({ assigned }) })
 }
@@ -185,10 +185,13 @@ export function assignOpenBay(spaceId: string, assigned: boolean) {
   return request<LiveBay>(`/api/bays/${encodeURIComponent(spaceId)}/assignment`, { method: 'POST', body: JSON.stringify({ assigned }) })
 }
 export function assignVisitorBay(token: string, spaceId: string) {
-  return request<{ session_id: string; status: string; space_id: string }>('/api/public/visitor/assign', { method: 'POST', headers: { 'X-Visitor-Token': token }, body: JSON.stringify({ space_id: spaceId }) })
+  return request<{ session_id: string; status: string; space_id: string; visitor_token?: string }>('/api/public/visitor/assign', { method: 'POST', headers: { 'X-Visitor-Token': token }, body: JSON.stringify({ space_id: spaceId }) })
 }
 export function assignAnonymousBay(spaceId: string) {
   return request<{ status: string; space_id: string }>('/api/public/assign-bay', { method: 'POST', body: JSON.stringify({ space_id: spaceId }) })
+}
+export function assignOpenVisitorBay(spaceId: string) {
+  return request<{ session_id: string; status: string; space_id: string; visitor_token: string }>('/api/public/assign-visitor-bay', { method: 'POST', body: JSON.stringify({ space_id: spaceId }) })
 }
 
 export function reportLiveBay(secureEvent: Record<string, unknown>) {

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { QRCodeSVG } from 'qrcode.react'
 import { CircleMarker, MapContainer, Polyline, Popup, TileLayer, useMap } from 'react-leaflet'
-import { adminLogin, backendEnabled, bootstrapAdmin, createAdminUser, createCheckpoint, createVisitorSession, downloadAdminEvents, getAdminAnalytics, getAdminBootstrapStatus, getAdminConfig, getAdminEvents, getAdminPublicUrl, saveAdminPublicUrl, getAdminSite, getAdminTariff, getDestination, getParkingAvailability, getPublicLiveAvailability, getPublicCheckpoint, getPublicEntry, getPublicTariff, getSecurityLot, getSecurityQueue, getSessionCharges, getStoredVisitorToken, getVisitorLayout, getVisitorMe, joinVisitorQueue, listAdminUsers, listCheckpoints, requestVisitorExit, saveAdminConfig, saveAdminSite, saveAdminTariff, simulateParkingEvent, storeVisitorToken, verifyVisitorArrival, recordManualPayment, confirmVehicleExit, visitorSocket, getPublicFacility, subscribeNewsletter, unsubscribeNewsletter, getLiveBays, assignOpenBay, assignVisitorBay, assignAnonymousBay, reportDemoBay, getFacilityConfig, type LiveBay, type AdminUser, type QueueRecord, type SiteSettings, type TariffSettings, type VisitorInvoice, type SystemConfig } from './api'
+import { backendEnabled, createAdminUser, createCheckpoint, createVisitorSession, downloadAdminEvents, getAdminAnalytics, getAdminConfig, getAdminEvents, getAdminPublicUrl, saveAdminPublicUrl, getAdminSite, getAdminTariff, getDestination, getParkingAvailability, getPublicLiveAvailability, getPublicCheckpoint, getPublicEntry, getPublicTariff, getSecurityLot, getSecurityQueue, getSessionCharges, getStoredVisitorToken, getVisitorLayout, getVisitorMe, joinVisitorQueue, listAdminUsers, listCheckpoints, requestVisitorExit, saveAdminConfig, saveAdminSite, saveAdminTariff, simulateParkingEvent, storeVisitorToken, verifyVisitorArrival, recordManualPayment, confirmVehicleExit, visitorSocket, getPublicFacility, subscribeNewsletter, unsubscribeNewsletter, getLiveBays, assignOpenBay, assignVisitorBay, assignAnonymousBay, assignOpenVisitorBay, reportDemoBay, getFacilityConfig, type LiveBay, type AdminUser, type QueueRecord, type SiteSettings, type TariffSettings, type VisitorInvoice, type SystemConfig } from './api'
 import {
   ArrowDownRight, ArrowRight, Bell, CarFront, Check, ChevronDown, CircleHelp, Clock3,
   Grid2x2, LayoutDashboard, ListFilter, LogOut, MapPin, Menu, MoreHorizontal, Navigation,
@@ -83,7 +83,7 @@ function App() {
   const [checkpointToken, setCheckpointToken] = useState(() => window.location.pathname.startsWith('/enter/') ? decodeURIComponent(window.location.pathname.slice('/enter/'.length)) : new URLSearchParams(window.location.search).get('checkpoint') || '')
   const [visitorTariff, setVisitorTariff] = useState<TariffSettings | null>(null)
   const [checkpointError, setCheckpointError] = useState('')
-  const [mode, setMode] = useState<'driver' | 'admin' | 'admin-login'>(() => (/^\/(admin|security|guard|reports|login)(\/|$)/.test(window.location.pathname) ? 'admin' : 'driver'))
+  const [mode, setMode] = useState<'driver' | 'admin'>(() => (/^\/(admin|security|guard|reports|login)(\/|$)/.test(window.location.pathname) ? 'admin' : 'driver'))
   const siteId = currentSiteId(pathname)
   const [spaces, setSpaces] = useState<Space[]>(() => backendEnabled ? initialSpaces.map((space) => ({ ...space, status: 'unavailable' })) : getDemoSiteSetup()?.setup_complete ? initialSpaces : [])
   const [activity, setActivity] = useState<Activity[]>(initialActivity)
@@ -114,7 +114,7 @@ function App() {
     else window.history.pushState(null, '', path)
     setPathname(window.location.pathname)
     if (/^\/(admin|security|guard|reports|login)(\/|$)/.test(window.location.pathname)) setMode('admin')
-    else if (mode !== 'admin-login') setMode('driver')
+    else setMode('driver')
     window.scrollTo({ top: 0, behavior: 'smooth' })
   }
 
@@ -157,9 +157,8 @@ function App() {
       if (!site) return
       setSiteName(site.name)
       setSiteLogo(site.logo_data_uri || '')
-      setLotConfigured(true)
-      if (site.latitude || site.longitude) setDestination({ configured: true, display_name: site.name, address: site.address, latitude: site.latitude, longitude: site.longitude, google_maps_url: `https://www.google.com/maps/dir/?api=1&destination=${site.latitude},${site.longitude}`, waypoints: [{ name: site.name, latitude: site.latitude, longitude: site.longitude }] })
-      if (site.setup_complete && site.latitude && site.longitude) setLotConfigured(true)
+      setLotConfigured(site.setup_complete)
+      if (site.setup_complete && site.latitude && site.longitude) setDestination({ configured: true, display_name: site.name, address: site.address, latitude: site.latitude, longitude: site.longitude, google_maps_url: `https://www.google.com/maps/dir/?api=1&destination=${site.latitude},${site.longitude}`, waypoints: [{ name: site.name, latitude: site.latitude, longitude: site.longitude }] })
       if (!backendEnabled) setSpaces(initialSpaces)
       else {
         void getPublicLiveAvailability().then((availability) => { setSpaces(availability.spaces.map((space) => ({ id: space.id, status: toUiStatus(space.status) }))); setAvailabilityState('live') }).catch(() => setAvailabilityState('error'))
@@ -214,8 +213,8 @@ function App() {
         if (checkpoint.latitude !== null && checkpoint.longitude !== null) setDestination({ configured: true, display_name: checkpoint.site_name, address: checkpoint.address, latitude: checkpoint.latitude, longitude: checkpoint.longitude, google_maps_url: `https://www.google.com/maps/dir/?api=1&destination=${checkpoint.latitude},${checkpoint.longitude}`, waypoints: [{ name: checkpoint.site_name, latitude: checkpoint.latitude, longitude: checkpoint.longitude }] })
       }
       void getPublicTariff(entrySiteId).then(setVisitorTariff).catch(() => setVisitorTariff(null))
-      // Visitor sessions are optional. Public availability and assignment work without login.
-      let token = checkpointToken ? null : getStoredVisitorToken()
+      // Passwordless visitor session preserves private assignment, timer, billing, and exit flow.
+      let token = getStoredVisitorToken()
       if (token) {
         try { await refreshBackendState(token) }
         catch { window.localStorage.removeItem('smartpark.visitor.token'); window.localStorage.removeItem('smartpark.visitor.token.expires'); token = null }
@@ -223,7 +222,17 @@ function App() {
       if (token) {
         setVisitorToken(token)
         socket = visitorSocket(token)
-        if (socket) socket.onmessage = () => { void refreshBackendState(token) }
+        if (socket) socket.onmessage = () => { if (token) void refreshBackendState(token) }
+      } else if (backendEnabled) {
+        try {
+          const session = await createVisitorSession(entrySiteId, checkpointToken || undefined)
+          token = session.visitor_token
+          storeVisitorToken(token, session.expires_at)
+          setVisitorToken(token)
+          setVisitorSessionId(session.session_id)
+          socket = visitorSocket(token)
+          if (socket) socket.onmessage = () => { void refreshBackendState(token!) }
+        } catch { setVisitorToken(null) }
       } else setVisitorToken(null)
     }
     void bootstrap().catch((error) => setCheckpointError(error instanceof Error ? `This entrance QR is invalid or revoked. Ask ParkTech staff for the current checkpoint QR. (${error.message})` : 'This entrance QR is invalid or revoked. Ask ParkTech staff for the current checkpoint QR.'))
@@ -295,11 +304,17 @@ function App() {
     const freeBay = spaces.find((space) => space.status === 'available')
     if (backendEnabled && freeBay) {
       try {
-        const result = await assignAnonymousBay(freeBay.id)
-        setAnonymousBay(result.space_id)
+        const result = visitorToken
+          ? await assignVisitorBay(visitorToken, freeBay.id)
+          : await assignOpenVisitorBay(freeBay.id)
+        const assignedVisitorToken = result.visitor_token || visitorToken
+        if (result.visitor_token) { storeVisitorToken(result.visitor_token); setVisitorToken(result.visitor_token) }
+        setVisitorSessionId(result.session_id)
+        setAnonymousBay(null)
         setReservationMessage(`Bay ${result.space_id} assigned. Use directions to reach the facility.`)
         setVisitorStarted(true)
         setSpaces((current) => current.map((space) => space.id === result.space_id ? { ...space, status: 'assigned', visitor: 'You · Guest' } : space))
+        if (assignedVisitorToken) void refreshBackendState(assignedVisitorToken)
         return
       } catch (error) { setReservationMessage(error instanceof Error ? error.message : 'Could not assign a bay.') }
     } else if (!backendEnabled && freeBay) {
@@ -311,10 +326,7 @@ function App() {
   }
 
   const occupyAssigned = () => {
-    if (anonymousBay) {
-      setBillingMessage('The bay occupancy and parking timer are driven by the physical sensor. Ask staff for help if the sensor does not update.')
-      return
-    }
+    if (anonymousBay) { setBillingMessage('This local-only preview does not create a parking timer.') ; return }
     setSpaces((current) => current.map((space) => space.visitor === 'You · Guest'
       ? { ...space, status: 'occupied', since: 'Just now' }
       : space))
@@ -345,8 +357,6 @@ function App() {
   if (mode === 'admin') {
     return <AdminDashboard spaces={spaces} stats={stats} activity={activity} onActivity={setActivity} view={adminView} setView={(view) => { setAdminView(view); navigate(pathForStaffView(view)) }} role={adminRole || 'SECURITY'} onMode={() => { navigate(pathForScreen('home', siteId), true); setAdminToken('open-interface'); setAdminRole('ADMIN'); setMode('driver') }} onSpaces={setSpaces} mobileOpen={mobileOpen} setMobileOpen={setMobileOpen} users={adminUsers} setUsers={setAdminUsers} adminToken={adminToken} siteId={siteId} />
   }
-
-  if (mode === 'admin-login') return <AdminDashboard spaces={spaces} stats={stats} activity={activity} onActivity={setActivity} view={adminView} setView={(view) => { setAdminView(view); navigate(pathForStaffView(view)) }} role="ADMIN" onMode={() => { navigate(pathForScreen('home', siteId), true); setMode('driver') }} onSpaces={setSpaces} mobileOpen={mobileOpen} setMobileOpen={setMobileOpen} users={adminUsers} setUsers={setAdminUsers} adminToken={adminToken} siteId={siteId} />
 
   return <DriverHome screen={driverScreen} onNavigate={(screen) => { const target = pathForScreen(screen, siteId); navigate(`${target}${checkpointToken ? `${target.includes('?') ? '&' : '?'}checkpoint=${encodeURIComponent(checkpointToken)}` : ''}`) }} spaces={spaces} visitorStarted={visitorStarted} visitorTariff={visitorTariff} checkpointError={checkpointError} onGuest={assignNext} reservationMessage={reservationMessage} canReserve={!backendEnabled || availabilityState === 'live'} onOccupy={occupyAssigned} onRequestExit={exitRequest} onPayDemo={payInvoice} invoice={visitorInvoice} billingMessage={billingMessage} availabilityState={availabilityState} mobileOpen={mobileOpen} setMobileOpen={setMobileOpen} siteName={siteName} siteLogo={siteLogo} installPrompt={installPrompt} destination={destination} lotConfigured={lotConfigured} assignment={visitorAssignment} estimate={chargeEstimate} />
 }
@@ -391,36 +401,6 @@ function QrDisplay() {
 }
 
 type BeforeInstallPromptEvent = Event & { prompt: () => Promise<void>; userChoice: Promise<{ outcome: 'accepted' | 'dismissed' }> }
-
-function AdminLoginScreen({ onBack, onLogin }: { onBack: () => void; onLogin: (token: string, role: AdminUser['role']) => void }) {
-  const [creatingFirstAdmin, setCreatingFirstAdmin] = useState(false)
-  const [bootstrapAvailable, setBootstrapAvailable] = useState(false)
-  const [email, setEmail] = useState('')
-  const [password, setPassword] = useState('')
-  const [displayName, setDisplayName] = useState('')
-  const [setupToken, setSetupToken] = useState('')
-  const [message, setMessage] = useState('')
-  useEffect(() => {
-    if (backendEnabled) void getAdminBootstrapStatus().then((status) => setBootstrapAvailable(status.available)).catch(() => setBootstrapAvailable(false))
-  }, [])
-  const submit = async (event: React.FormEvent) => {
-    event.preventDefault()
-    setMessage('')
-    if (!backendEnabled) { onLogin('demo-admin', 'ADMIN'); return }
-    try {
-      const result = creatingFirstAdmin
-        ? await bootstrapAdmin({ setup_token: setupToken, display_name: displayName, email, password })
-        : await adminLogin(email, password)
-      onLogin(result.access_token, result.user.role)
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : ''
-      setMessage(creatingFirstAdmin
-        ? reason === 'invalid_setup_code' ? 'That ParkTech setup code is not valid.' : reason === 'first_admin_already_created' ? 'The first administrator has already been created. Ask them to add your staff account.' : 'Could not create the first account. Check the details and try again.'
-        : reason === 'invalid_admin_credentials' ? 'Invalid ParkTech staff email or password. Ask your ParkTech administrator for an account.' : 'Could not sign in. Check your connection and try again.')
-    }
-  }
-  return <div className="admin-login-shell"><div className="admin-login-card"><button className="back-link" onClick={onBack}><ArrowRight size={15} className="back-arrow" /> Back to visitor portal</button><Brand /><div className="admin-login-kicker">ParkTech operations</div><h1>{creatingFirstAdmin ? 'Set up ParkTech admin' : 'Staff sign in'}</h1><p>{creatingFirstAdmin ? 'Create the first administrator account. The setup code is provided by the ParkTech system operator.' : 'Sign in to manage ParkTech parking lots and daily operations.'}</p><form onSubmit={submit}>{creatingFirstAdmin && <><label>ParkTech setup code<input required minLength={8} type="password" value={setupToken} onChange={(event) => setSetupToken(event.target.value)} autoComplete="one-time-code" /></label><label>Full name<input required minLength={2} pattern="[A-Za-z]+([ '-][A-Za-z]+)*" value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder="Ama Mensah" autoComplete="name" /></label></>}<label>Work email<input required type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@parktech.com" autoComplete="username" /></label><label>Password<input required minLength={12} type="password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="At least 12 characters" autoComplete={creatingFirstAdmin ? 'new-password' : 'current-password'} /></label><button className="button button-primary" type="submit"><ShieldCheck size={17} /> {creatingFirstAdmin ? 'Create first admin account' : 'Sign in securely'}</button></form>{!backendEnabled && <span className="demo-login-note">Demo mode: sign in to preview ParkTech operations.</span>}{message && <p className="login-error" role="alert">{message}</p>}{bootstrapAvailable && <button type="button" className="login-switch" onClick={() => { setCreatingFirstAdmin(!creatingFirstAdmin); setMessage('') }}>{creatingFirstAdmin ? 'Already set up? Staff sign in' : 'First time here? Create the first ParkTech admin account'}</button>}<div className="login-security"><ShieldCheck size={15} /><span>Staff accounts are protected by server-side role permissions.</span></div></div></div>
-}
 
 function Brand({ compact = false, logoUrl }: { compact?: boolean; logoUrl?: string }) {
   return <div className={`brand ${compact ? 'brand-compact' : ''}`}>{logoUrl ? <img className="brand-logo-image" src={logoUrl} alt="Facility logo" /> : <span className="brand-mark"><CarFront size={compact ? 17 : 20} strokeWidth={2.5} /></span>}<span>Smart <span>Park</span></span></div>
@@ -552,7 +532,7 @@ function CampusMapCard({ destination }: { destination: CampusDestination | null 
   useEffect(() => {
     if (!backendEnabled || destination?.latitude) return
     void getFacilityConfig().then((site) => {
-      if (site.latitude && site.longitude) window.dispatchEvent(new CustomEvent('smartpark:facility-coordinates', { detail: site }))
+      if (site.latitude !== null && site.longitude !== null) window.dispatchEvent(new CustomEvent('smartpark:facility-coordinates', { detail: site }))
     }).catch(() => undefined)
   }, [destination?.latitude])
   const internalWaypoints: [number, number][] = destination?.waypoints?.map((point) => [point.latitude, point.longitude]) || []
@@ -601,6 +581,7 @@ function CampusMapCard({ destination }: { destination: CampusDestination | null 
   }
   const mapsUrl = new URL(destination?.google_maps_url || 'https://www.google.com/maps/dir/?api=1')
   if (position) mapsUrl.searchParams.set('origin', `${position[0]},${position[1]}`)
+  if (!destination || destination.latitude === null || destination.longitude === null) return <section className="gps-card"><div className="gps-card-head"><div><div className="eyebrow"><MapPin size={13} /> Parking directions</div><h3>Set the facility entrance</h3><p>Staff can add the parking entrance in Facility setup.</p></div></div><p className="gps-route-note">Your live GPS can still be read on this device. Set the facility coordinates to show directions to the lot.</p><div className="gps-actions"><button className="button button-primary" onClick={locate} disabled={!online}><Navigation size={16} /> {locationState === 'loading' ? 'Waiting for GPS…' : locationState === 'ready' ? 'Update live position' : 'GET MY GPS'}</button><a className="button button-secondary" href="/admin/settings">Facility setup</a></div>{locationState === 'ready' && position && <p className="gps-message" role="status">Current device location: {position[0].toFixed(6)}, {position[1].toFixed(6)} (±{accuracy ? Math.round(accuracy) : '?'} m). Location remains on this device.</p>}{locationState === 'denied' && <p className="gps-message" role="status">Location permission was denied or GPS is unavailable. Browser GPS generally requires HTTPS or localhost.</p>}</section>
   return <section className="gps-card"><div className="gps-card-head"><div><div className="eyebrow"><MapPin size={13} /> Parking directions · facility entrance</div><h3>{destination?.display_name || 'Parking lot'}</h3><p>{destination?.address || 'Loading destination coordinates...'}</p></div><span className="gps-badge"><span className="live-dot" /> {locationState === 'ready' ? 'Live position' : locationState === 'loading' ? 'Waiting for GPS' : online ? 'Destination ready' : 'Offline'}</span></div><p className="gps-privacy">Live navigation starts only when you choose it. Smart Park does not store or send your location to its backend. For road routing, the configured routing provider receives your current position and this facility entrance; OpenStreetMap also loads map tiles. Google Maps receives your origin only if you open its directions link. Your GPS cannot identify an individual bay.</p><div className="gps-map-wrap"><MapContainer center={destinationPosition} zoom={16} scrollWheelZoom={false} className="gps-map"><TileLayer attribution='&copy; OpenStreetMap contributors' url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" /><Polyline positions={routePoints} pathOptions={{ color: '#2563eb', weight: 5 }} /><CircleMarker center={destinationPosition} radius={10} pathOptions={{ color: '#064e3b', fillColor: '#087f5b', fillOpacity: 1 }}><Popup>{destination?.display_name ?? "Parking lot entrance"}</Popup></CircleMarker>{position && <><MapRecenter position={position} /><CircleMarker center={position} radius={8} pathOptions={{ color: '#fff', weight: 3, fillColor: '#f59e0b', fillOpacity: 1 }}><Popup>Your current position · ±{accuracy ? Math.round(accuracy) : '?'} m</Popup></CircleMarker></>}</MapContainer><div className="map-label destination-label"><MapPin size={14} /> {destination?.display_name ?? "Parking lot"}{routeStats && ` · ${(routeStats.distance / 1000).toFixed(1)} km · ${Math.ceil(routeStats.duration / 60)} min`}</div></div><p className="gps-route-note">{routeStats ? `Road route · about ${(routeStats.distance / 1000).toFixed(1)} km and ${Math.ceil(routeStats.duration / 60)} minutes. Follow signs for the final approach.` : routeError ? 'The routing provider is unavailable. The straight-line guide and external directions link are still available.' : 'The line is a guide to the facility entrance. Individual indoor bays are shown separately in the parking diagram.'}</p><div className="gps-actions"><button className="button button-primary" onClick={locate} disabled={!online}><Navigation size={16} /> {locationState === 'loading' ? 'Waiting for GPS…' : locationState === 'ready' ? 'Update live position' : 'START DIRECTIONS'}</button>{locationState === 'ready' && <button className="button button-secondary" onClick={() => { if (watchId.current !== null) navigator.geolocation.clearWatch(watchId.current); watchId.current = null; setLocationState('idle'); setPosition(null); setRoadRoute(null); setRouteStats(null) }}>Stop navigation</button>}<a className="button button-secondary" href={mapsUrl.toString()} target="_blank" rel="noreferrer"><ArrowRight size={16} /> OPEN IN GOOGLE MAPS</a></div>{locationState === 'denied' && <p className="gps-message" role="status">Location permission was denied or GPS is unavailable. The static destination and external directions link still work.</p>}{!online && <p className="gps-message" role="status">You are offline. The saved destination remains visible; road directions need a network connection.</p>}{accuracy !== null && accuracy > 100 && <p className="gps-message" role="status">GPS accuracy is about {Math.round(accuracy)} m. Use the map only for general guidance, not to identify adjacent parking spaces.</p>}</section>
 }
 
