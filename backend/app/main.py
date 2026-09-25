@@ -19,9 +19,12 @@ from typing import Any
 import qrcode
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 ROOT = Path(__file__).resolve().parents[1]
+WEB_DIST = ROOT.parent / "dist"
 DATABASE_URL = os.getenv("SMARTPARK_DATABASE_URL", f"sqlite:///{ROOT / 'smartpark.db'}")
 DATABASE_PATH = Path(DATABASE_URL.removeprefix("sqlite:///"))
 if not DATABASE_PATH.is_absolute():
@@ -133,7 +136,7 @@ def init_db() -> None:
                 db.execute("INSERT OR IGNORE INTO tariffs(site_id, free_minutes, block_minutes, block_price_minor, currency, grace_minutes, daily_cap_minor, timezone) SELECT ?, free_minutes, block_minutes, block_price_minor, currency, grace_minutes, daily_cap_minor, timezone FROM tariffs WHERE site_id = ?", (SITE_ID, legacy["id"]))
                 db.execute("DELETE FROM tariffs WHERE site_id = ?", (legacy["id"],))
                 db.execute("DELETE FROM sites WHERE id = ?", (legacy["id"],))
-        for space_id in ("L1", "L2", "L3", "L4"):
+        for space_id in ("L1", "L2"):
             db.execute("INSERT OR IGNORE INTO parking_spaces VALUES (?, ?, 'AVAILABLE', NULL, NULL, ?)", (space_id, SITE_ID, now()))
         for space_id in ("L1", "L2"):
             db.execute("INSERT OR IGNORE INTO bay_sensor_state(space_id, physical_state, updated_at) VALUES (?, 'UNKNOWN', ?)", (space_id, now()))
@@ -177,6 +180,10 @@ class SensorEvent(BaseModel):
     facility_id: str | None = None
     measured_at: str | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class DeviceHeartbeat(BaseModel):
+    sensors: dict[str, bool] = Field(default_factory=dict)
 
 
 class SimulatorEvent(BaseModel):
@@ -697,12 +704,17 @@ async def assign_public_visitor_bay(assignment: VisitorBayAssignment, x_visitor_
         existing = db.execute("SELECT id, space_id FROM reservations WHERE session_id = ? AND status IN ('RESERVED','OCCUPIED')", (visitor["id"],)).fetchone()
         if existing:
             return {"session_id": visitor["id"], "status": "ASSIGNED", "space_id": existing["space_id"]}
-        changed = db.execute("UPDATE parking_spaces SET status='RESERVED', assigned_session=?, updated_at=? WHERE id=? AND status='AVAILABLE'", (visitor["id"], now(), assignment.space_id))
-        if changed.rowcount != 1:
+        bay = db.execute("SELECT status, assigned_session FROM parking_spaces WHERE id=? AND site_id=?", (assignment.space_id, visitor["site_id"])).fetchone()
+        if not bay or bay["status"] == "OCCUPIED" or bay["assigned_session"] not in (None, "DEMO_DRIVER", "OPEN_DEMO"):
             raise HTTPException(409, "bay_no_longer_available")
         timestamp = now()
+        changed = db.execute("UPDATE parking_spaces SET status='RESERVED', assigned_session=?, updated_at=? WHERE id=? AND assigned_session IS ?", (visitor["id"], timestamp, assignment.space_id, bay["assigned_session"]))
+        if changed.rowcount != 1:
+            raise HTTPException(409, "bay_no_longer_available")
+        db.execute("UPDATE reservations SET status='EXPIRED' WHERE space_id=? AND status='RESERVED'", (assignment.space_id,))
         db.execute("UPDATE visitor_sessions SET status='ASSIGNED' WHERE id=?", (visitor["id"],))
         db.execute("INSERT INTO reservations VALUES (?, ?, ?, 'RESERVED', ?, NULL, NULL)", (secrets.token_urlsafe(12), assignment.space_id, visitor["id"], timestamp))
+        db.execute("UPDATE bay_sensor_state SET last_seen=? WHERE space_id=?", (timestamp, assignment.space_id))
         audit(db, "visitor_bay_assigned", f"Visitor assigned confirmed-free bay {assignment.space_id}", assignment.space_id, visitor["id"])
     await manager.broadcast({"type": "space_reserved", "space_id": assignment.space_id}, visitor["id"])
     await manager.broadcast({"type": "bay_state_changed", "space_id": assignment.space_id})
@@ -723,6 +735,7 @@ async def assign_anonymous_bay(assignment: VisitorBayAssignment) -> dict[str, An
             raise HTTPException(409, "bay_already_assigned")
         timestamp = now()
         db.execute("UPDATE parking_spaces SET status='RESERVED', assigned_session='OPEN_DEMO', updated_at=? WHERE id=?", (timestamp, assignment.space_id))
+        db.execute("UPDATE bay_sensor_state SET last_seen=? WHERE space_id=?", (timestamp, assignment.space_id))
         db.execute("UPDATE demo_bay_assignments SET active = 0 WHERE space_id = ? AND active = 1", (assignment.space_id,))
         db.execute("INSERT INTO demo_bay_assignments(id, space_id, created_at, active) VALUES (?, ?, ?, 1)", (secrets.token_urlsafe(10), assignment.space_id, timestamp))
         audit(db, "bay_assignment", f"{assignment.space_id} assigned through public arrival interface", assignment.space_id)
@@ -1036,7 +1049,7 @@ def live_bays() -> list[dict[str, Any]]:
     with connect() as db:
         rows = db.execute("""SELECT p.id, COALESCE(s.physical_state, 'UNKNOWN') AS physical_state,
             s.device_id, s.last_seen, s.updated_at AS sensor_updated_at,
-            CASE WHEN s.last_seen IS NULL OR s.last_seen < ? THEN 'WAITING_FOR_SENSOR'
+            CASE WHEN s.last_seen IS NULL OR s.last_seen < ? OR s.physical_state NOT IN ('FREE','OCCUPIED') THEN 'WAITING_FOR_SENSOR'
                  WHEN s.physical_state = 'OCCUPIED' THEN 'OCCUPIED'
                  WHEN p.status = 'OCCUPIED' AND COALESCE(s.physical_state, 'UNKNOWN') != 'FREE' THEN 'OCCUPIED'
                  WHEN p.assigned_session IS NOT NULL AND COALESCE(s.physical_state, 'UNKNOWN') = 'FREE' THEN 'ASSIGNED'
@@ -1055,8 +1068,12 @@ def get_live_bays() -> dict[str, Any]:
 @app.get("/api/public/live-availability")
 def public_live_availability() -> dict[str, Any]:
     bays = live_bays()
+    with connect() as db:
+        site = db.execute("SELECT setup_complete FROM sites WHERE id = ?", (SITE_ID,)).fetchone()
+    if not site:
+        raise HTTPException(404, "site_not_found")
     spaces = [{"id": bay["id"], "status": "OCCUPIED" if bay["display_state"] == "OCCUPIED" else "RESERVED" if bay["display_state"] == "ASSIGNED" else "AVAILABLE" if bay["display_state"] == "AVAILABLE" else "UNKNOWN"} for bay in bays]
-    return {"site_id": SITE_ID, "total": len(spaces), "available": sum(space["status"] == "AVAILABLE" for space in spaces), "occupied": sum(space["status"] == "OCCUPIED" for space in spaces), "unavailable": sum(space["status"] == "UNKNOWN" for space in spaces), "spaces": spaces, "configured": True, "updated_at": now()}
+    return {"site_id": SITE_ID, "total": len(spaces), "available": sum(space["status"] == "AVAILABLE" for space in spaces), "occupied": sum(space["status"] == "OCCUPIED" for space in spaces), "unavailable": sum(space["status"] == "UNKNOWN" for space in spaces), "spaces": spaces, "configured": bool(site["setup_complete"]), "updated_at": now()}
 
 
 @app.get("/api/public/facility-config")
@@ -1069,6 +1086,7 @@ def public_facility_config() -> dict[str, Any]:
 
 
 @app.post("/api/v1/security/bays/{space_id}/assignment")
+@app.post("/api/bays/{space_id}/assignment")
 async def set_bay_assignment(space_id: str, assignment: BayAssignment) -> dict[str, Any]:
     if space_id not in ("L1", "L2"):
         raise HTTPException(404, "bay_not_found")
@@ -1092,11 +1110,6 @@ async def set_bay_assignment(space_id: str, assignment: BayAssignment) -> dict[s
         audit(db, "bay_assignment", f"{space_id} {'assigned to demo driver' if assignment.assigned else 'assignment cleared'}", space_id)
     await manager.broadcast({"type": "bay_state_changed", "space_id": space_id})
     return next(bay for bay in live_bays() if bay["id"] == space_id)
-
-
-@app.post("/api/bays/{space_id}/assignment")
-async def set_public_demo_assignment(space_id: str, assignment: BayAssignment) -> dict[str, Any]:
-    return await set_bay_assignment(space_id, assignment)
 
 
 @app.get("/api/v1/security/arrivals", dependencies=[Depends(roles_required("SECURITY", "ADMIN", "MANAGER"))])
@@ -1284,10 +1297,43 @@ async def iot_event(event: SensorEvent, authenticated_device: str | None = Depen
 async def live_iot_event(event: SensorEvent, authenticated_device: str | None = Depends(device_required)) -> dict[str, Any]:
     if authenticated_device and event.device_id != authenticated_device:
         raise HTTPException(403, "device_identity_mismatch")
-    if event.space_id not in ("L1", "L2") or event.event_type.lower() not in ("bay_occupied", "bay_free", "bay_vacant", "space_vacant"):
+    event_type = event.event_type.lower()
+    bay_events = ("bay_occupied", "bay_free", "bay_vacant", "space_vacant")
+    supported_events = bay_events + ("vehicle_detected", "gate_opened", "gate_closed", "device_heartbeat", "sensor_error")
+    if event_type not in supported_events or (event_type in bay_events and event.space_id not in ("L1", "L2")):
         raise HTTPException(422, "invalid_two_bay_event")
     if event.facility_id and event.facility_id != SITE_ID:
         raise HTTPException(403, "device_facility_mismatch")
+    if event_type in bay_events and event_type in ("bay_occupied", "bay_free", "bay_vacant", "space_vacant"):
+        with connect() as db:
+            prior = db.execute("SELECT event_type FROM iot_events WHERE event_id=?", (event.event_id,)).fetchone()
+            if prior:
+                return {"status": "duplicate", "event_id": event.event_id}
+            latest = db.execute("SELECT physical_state FROM bay_sensor_state WHERE space_id=?", (event.space_id,)).fetchone()
+        incoming_state = "OCCUPIED" if event_type == "bay_occupied" else "FREE"
+        if latest and latest["physical_state"] == incoming_state:
+            return {"status": "duplicate_state", "event_id": event.event_id}
+    if event_type not in bay_events:
+        with DB_LOCK, connect() as db:
+            if db.execute("SELECT 1 FROM iot_events WHERE event_id = ?", (event.event_id,)).fetchone():
+                return {"status": "duplicate", "event_id": event.event_id}
+            measured_at = event.measured_at or event.observed_at or now()
+            db.execute("INSERT INTO iot_events VALUES (?, ?, ?, ?, ?, ?, ?)", (event.event_id, event.device_id, event.sensor_id, event_type, event.space_id, measured_at, now()))
+            if event_type == "sensor_error":
+                if event.space_id in ("L1", "L2"):
+                    db.execute("UPDATE bay_sensor_state SET physical_state='UNKNOWN', last_seen=NULL, updated_at=? WHERE space_id=? AND device_id=?", (measured_at, event.space_id, event.device_id))
+            if event_type == "device_heartbeat":
+                db.execute("INSERT INTO devices(id, name, online, last_seen) VALUES (?, ?, 1, ?) ON CONFLICT(id) DO UPDATE SET online=1, last_seen=excluded.last_seen", (event.device_id, event.device_id, measured_at))
+                for space_id, healthy in event.payload.get("sensors", {}).items():
+                    if space_id not in ("L1", "L2"):
+                        continue
+                    if healthy:
+                        db.execute("UPDATE bay_sensor_state SET last_seen=? WHERE space_id=? AND device_id=? AND physical_state IN ('FREE','OCCUPIED')", (measured_at, space_id, event.device_id))
+                    else:
+                        db.execute("UPDATE bay_sensor_state SET physical_state='UNKNOWN', last_seen=NULL, updated_at=? WHERE space_id=? AND device_id=?", (measured_at, space_id, event.device_id))
+            audit(db, event_type, f"Device {event.device_id}: {event.payload}", event.space_id)
+        await manager.broadcast({"type": event_type, "space_id": event.space_id})
+        return {"status": "processed", "event_id": event.event_id}
     state = "OCCUPIED" if event.event_type.lower() == "bay_occupied" else "FREE"
     measured_at = event.measured_at or event.observed_at or now()
     received_at = now()
@@ -1297,7 +1343,7 @@ async def live_iot_event(event: SensorEvent, authenticated_device: str | None = 
             return {"status": "duplicate", "event_id": event.event_id}
         db.execute("INSERT INTO iot_events VALUES (?, ?, ?, ?, ?, ?, ?)", (event.event_id, event.device_id, event.sensor_id, "bay_" + state.lower(), event.space_id, measured_at, now()))
         db.execute("INSERT INTO bay_sensor_state(space_id, physical_state, device_id, last_seen, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(space_id) DO UPDATE SET physical_state=excluded.physical_state, device_id=excluded.device_id, last_seen=excluded.last_seen, updated_at=excluded.updated_at", (event.space_id, state, event.device_id, received_at, received_at))
-        db.execute("UPDATE parking_spaces SET status='AVAILABLE' WHERE id=? AND site_id=? AND status='UNKNOWN' AND assigned_session IS NULL AND ?='FREE'", (event.space_id, SITE_ID, state))
+        db.execute("UPDATE parking_spaces SET status='AVAILABLE' WHERE id=? AND site_id=? AND assigned_session IS NULL AND ?='FREE'", (event.space_id, SITE_ID, state))
         if state == "FREE":
             db.execute("UPDATE parking_spaces SET status = 'AVAILABLE' WHERE id = ? AND status IN ('UNKNOWN','AVAILABLE') AND assigned_session IS NULL", (event.space_id,))
         if state == "OCCUPIED":
@@ -1369,14 +1415,21 @@ async def live_iot_demo_event(event: SensorEvent) -> dict[str, Any]:
 
 
 @app.post("/api/v1/iot/heartbeat")
-def iot_heartbeat(device_id: str, name: str = "Raspberry Pi sensor agent", authenticated_device: str | None = Depends(device_required)) -> dict[str, str]:
+def iot_heartbeat(device_id: str, heartbeat: DeviceHeartbeat = DeviceHeartbeat(), name: str = "Raspberry Pi sensor agent", authenticated_device: str | None = Depends(device_required)) -> dict[str, str]:
     if authenticated_device and device_id != authenticated_device:
         raise HTTPException(403, "device_identity_mismatch")
     with connect() as db:
         timestamp = now()
         db.execute("INSERT INTO devices(id, name, online, last_seen) VALUES (?, ?, 1, ?) ON CONFLICT(id) DO UPDATE SET online=1, last_seen=excluded.last_seen", (device_id, name, timestamp))
-        # Keep known bay states fresh while this device is healthy; don't add state rows for uninitialized sensors.
-        db.execute("UPDATE bay_sensor_state SET last_seen = ? WHERE device_id = ? AND physical_state IN ('FREE','OCCUPIED')", (timestamp, device_id))
+        # Device liveness does not prove each sensor is healthy. Refresh only bays
+        # that returned a valid reading; clear failed sensors so the UI shows waiting.
+        for space_id, healthy in heartbeat.sensors.items():
+            if space_id not in ("L1", "L2"):
+                raise HTTPException(422, "invalid_sensor_id")
+            if healthy:
+                db.execute("UPDATE bay_sensor_state SET last_seen = ? WHERE space_id = ? AND device_id = ? AND physical_state IN ('FREE','OCCUPIED')", (timestamp, space_id, device_id))
+            else:
+                db.execute("UPDATE bay_sensor_state SET physical_state='UNKNOWN', last_seen=NULL, updated_at=? WHERE space_id=? AND device_id=?", (timestamp, space_id, device_id))
     return {"device_id": device_id, "status": "online"}
 
 
@@ -1529,3 +1582,20 @@ async def operations_socket(websocket: WebSocket, authorization: str = Query(...
             await websocket.receive_text()
     except WebSocketDisconnect:
         manager.operations.discard(websocket)
+
+
+if (WEB_DIST / "assets").is_dir():
+    app.mount("/assets", StaticFiles(directory=WEB_DIST / "assets"), name="web-assets")
+    for public_file in ("icons", "manifest.webmanifest", "sw.js", "poster.html"):
+        target = WEB_DIST / public_file
+        if target.exists():
+            if target.is_dir():
+                app.mount(f"/{public_file}", StaticFiles(directory=target), name=f"web-{public_file.replace('.', '-')}")
+            else:
+                app.mount(f"/{public_file}", StaticFiles(directory=WEB_DIST, html=False), name=f"web-{public_file.replace('.', '-')}")
+
+    @app.get("/{path:path}", include_in_schema=False)
+    def web_app(path: str):
+        if path.startswith(("api/", "docs", "openapi.json", "health")):
+            raise HTTPException(404, "not_found")
+        return FileResponse(WEB_DIST / "index.html")

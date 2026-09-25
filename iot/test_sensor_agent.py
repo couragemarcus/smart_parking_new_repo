@@ -17,10 +17,19 @@ def test_gate_requires_multiple_clear_samples_and_tolerates_missing_echo():
     gate.update(None, None, now=1)
     assert events == ["gate_opened"]
     for _ in range(4):
-        gate.update(None, 100, now=2)
+        gate.update(None, 90, now=2)
     assert events == ["gate_opened"]
-    gate.update(None, 100, now=2)
+    gate.update(None, 90, now=2)
     assert events == ["gate_opened", "gate_closed"]
+
+
+def test_gate_does_not_close_if_car_is_still_in_clearance_zone():
+    events = []
+    gate = GateStateMachine(events.append, minimum_open_seconds=0)
+    gate.update(True, 50, now=0)
+    for _ in range(7):
+        gate.update(None, 78, now=10)
+    assert events == ["gate_opened"]
 
 
 def test_standalone_test_does_not_touch_gpio():
@@ -40,8 +49,8 @@ def test_event_client_retries_same_idempotency_key(tmp_path):
             self.headers = {}
             self.calls = []
 
-        def post(self, url, json, timeout):
-            self.calls.append(json.copy())
+        def post(self, url, json=None, timeout=5):
+            self.calls.append((url, json.copy() if json else None, self.headers.copy()))
             if len(self.calls) == 1:
                 raise OSError("temporary network failure")
             return Response()
@@ -52,8 +61,17 @@ def test_event_client_retries_same_idempotency_key(tmp_path):
     session = Session()
     try:
         client = EventClient(Settings(device_token="test", queue_path=str(tmp_path / "outbox.jsonl"), retry_seconds=0), session)
-        assert client.event("bay_free", "L1", "L1")["status"] == "processed"
-        assert session.calls[0]["event_id"] == session.calls[1]["event_id"]
+        response = client.event("bay_free", "L1", "L1")
+        assert response["status"] == "queued"
+        client.flush()
+        assert session.calls[0][1]["event_id"] == session.calls[1][1]["event_id"]
         assert not (tmp_path / "outbox.jsonl").read_text(encoding="utf-8")
+
+        session.calls.clear()
+        client.heartbeat({"L1": False, "L2": True})
+        heartbeat_url, heartbeat_body, heartbeat_headers = session.calls[-1]
+        assert heartbeat_url.endswith("/api/v1/iot/heartbeat?device_id=pi-main-gate")
+        assert heartbeat_body == {"sensors": {"L1": False, "L2": True}}
+        assert heartbeat_headers["x-device-token"] == "test"
     finally:
         sensor_agent.time.sleep = original_sleep

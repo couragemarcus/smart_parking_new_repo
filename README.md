@@ -1,4 +1,4 @@
-# SmartPark
+﻿# SmartPark
 
 Smart Park is a single-facility, mobile-first parking PWA operated by ParkTech. An administrator configures the facility name, logo, entrance coordinates, rates, staff, public HTTPS URL, and entrance QR. Drivers scan one permanent QR to open the map-first visitor flow without an account, app install, or arrival code.
 
@@ -9,7 +9,7 @@ src/                    React/Vite visitor PWA and security dashboard
 	App.tsx               Visitor, GPS, QR scanner, open staff workspace, and dashboards
 	api.ts                Typed REST/WebSocket client
 	styles.css            Responsive visual system
-backend/app/main.py    FastAPI routes, SQLite models, auth, QR generation, WebSockets
+	backend/app/main.py    FastAPI routes, SQLite persistence, QR generation, WebSockets, Pi-hosted web bundle
 backend/tests/          API and validation tests
 iot/                   Raspberry Pi hardware agent, simulator, and tests
 public/                 PWA manifest, service worker, icons, printable poster
@@ -23,7 +23,7 @@ The implemented scope, migration limits, and API demonstration flow are in [docs
 
 ### Frontend only
 
-The frontend runs in demo mode when `VITE_API_URL` is unset.
+The development frontend uses demo mode when `VITE_API_URL` is unset.
 
 ```powershell
 npm install
@@ -77,40 +77,25 @@ npm run build
 python -m pytest backend/tests -q
 ```
 
-The test suite covers allocation order, duplicate sensor events, privacy boundaries, public QR safety, invalid sites, admin account creation, login sessions, and field validation.
+The test suite covers allocation order, duplicate sensor events, privacy boundaries, public QR safety, direct staff access, two-bay assignment, passwordless visitor sessions, invalid sites, and field validation.
 
 ## Visitor flow
 
-1. Scan the permanent main entrance QR. It opens `/enter/{signed-checkpoint-token}` in the phone browser; no in-app scanner or app install is required.
-2. Each scan creates an isolated anonymous session, with a six-digit arrival code shown only to that visitor.
-3. The welcome screen shows live availability, public space states, facility directions, posted GH₵ rates, and parking guidance. It does not promise a bay before assignment.
-4. The driver checks in at the entrance. Security asks to see the arrival code in person and verifies it in **Visitor queue**.
-5. The backend transaction assigns the first available bay in order (L1→L4); if full, the verified visitor waits for the next confirmed vacancy.
-6. A private WebSocket update shows only that driver's assignment. The map pulses their reserved bay; the public layout hides other drivers' identities.
-7. The visitor explicitly starts GPS navigation. The route is to the facility entrance, followed by the simple in-app bay diagram. GPS never identifies an indoor bay.
-8. A configured bay sensor or authorized simulator confirms parking and starts the server-side timer. Exit billing, demo payment, staff authorization, and confirmed vacancy remain separate steps.
+1. Open the visitor link or scan the entrance QR. The QR is an optional way to open the interface, not a sign-in requirement.
+2. The browser creates a private anonymous session token; no username/password form is shown. The token ties one driver's assignment to the live parking timer and exit flow.
+3. The visitor screen shows live L1/L2 sensor state, GPS directions to the configured facility, and the posted tariff.
+4. A visitor can request a bay only after the backend confirms a recent physical-free state. Staff may also assign a confirmed-free bay from the Live bays dashboard.
+5. The L1/L2 sensor reports occupancy to the backend, which starts the server-side timer for an assigned session and shows the bay as occupied.
+6. At exit, the server calculates the charge. Staff records cash or other manual payment and confirms vehicle exit; a confirmed free sensor reading releases the bay.
 
-The 5 cm entrance sensor setting detects proximity only. It cannot identify a phone, visitor, or bay. Security verifies the driver's arrival code before allocation. A physical Pi is not considered validated until tested with the actual deployment hardware.
-
-## Admin and account access
-
-The staff workspace is currently configured for direct access with no login. All users who can access `/admin` can manage the facility. Staff account creation and role-based access are not used in this mode.
-
-- Alphabetic name characters plus spaces, apostrophes, or hyphens
-- Valid email address
-- Ghana Card format `GHA-123456789-0`
-- Exactly 10 phone digits
-- Password of at least 12 characters
-- Role: `SECURITY`, `ADMIN`, or `MANAGER`
-
-The backend stores PBKDF2 password hashes and a SHA-256 Ghana Card hash plus last four digits. It never returns passwords or full card numbers. The bootstrap token is for local setup only and must be replaced in production.
+GPS is requested only when the driver starts navigation. It cannot identify a driver or indoor bay. A physical Pi is not considered validated until tested with the actual deployment hardware.
 
 ## QR, PWA, and phone testing
 
-Set `SMARTPARK_PUBLIC_ENTRY_URL` to the permanent HTTPS base URL for deployment (the local default is `http://localhost:5173`). On a phone, use an HTTPS tunnel or LAN-reachable HTTPS address rather than localhost. The admin creates a signed checkpoint QR from **Settings**; replacing it requires a deliberate confirmation and invalidates the old QR. The QR does not identify the driver:
+Set `SMARTPARK_PUBLIC_ENTRY_URL` to the permanent HTTPS base URL for deployment (the local default is `http://localhost:5173`). The visitor QR points directly to `/visit?facility=default`; it is a public entry URL and does not use signed checkpoint tokens or a login. On a phone, use an HTTPS tunnel or LAN-reachable HTTPS address rather than localhost.
 
 ```text
-https://your-domain/enter/<checkpoint-id>.<signature>
+https://your-domain/visit?facility=default
 ```
 
 Public QR and metadata routes:
@@ -119,81 +104,82 @@ Public QR and metadata routes:
 GET /api/public/sites/default/entry
 GET /api/public/sites/default/qr?format=svg
 GET /api/public/sites/default/qr?format=png
-GET /api/v1/public/checkpoints/{signed-token}
-POST /api/v1/visitor/sessions?checkpoint_token={signed-token}
+GET /api/public/live-availability
+GET /api/public/facility-config
+POST /api/v1/visitor/sessions?site_id=default
+POST /api/public/assign-visitor-bay
 POST /api/v1/visitor/arrivals
-POST /api/v1/security/arrivals/{session_id}/verify
 ```
 
 For phone testing, set `VITE_API_URL` to an HTTPS API URL reachable by the phone and add the exact PWA origin to `SMARTPARK_CORS_ORIGINS`. Geolocation requires HTTPS (except localhost). The visitor page requests location only after the driver taps **Start live navigation**. GPS fixes stay in browser memory and are not sent to FastAPI. While navigation is active, `VITE_ROUTING_URL` (default OSRM demo router) receives the current and destination coordinates to calculate the road route, distance, and ETA; use a production routing provider for deployment. OpenStreetMap tile requests also go to their tile service. Provider failure falls back to the static destination and Google Maps link. Navigation stops when the visitor leaves the map or taps **Stop navigation**. Phone GPS cannot identify an individual bay.
 
 The PWA manifest is `/manifest.webmanifest`; `/sw.js` caches only public shell assets. API responses, assignments, and occupancy data are never cached as current truth.
 
-For a phone or Pi on the same network, bind both services to `0.0.0.0`, set `VITE_API_URL=http://<computer-lan-ip>:8000`, and add `http://<computer-lan-ip>:5173` to `SMARTPARK_CORS_ORIGINS`. Restart Vite after changing `.env.local`. For camera and geolocation features, use HTTPS in production or an HTTPS tunnel during testing. A phone cannot reach the computer's `localhost`.
+In Pi production mode, the built browser app uses same-origin API requests automatically. No computer-hosted Vite process or CORS setting is needed. For local development with a separate API set `VITE_API_URL=http://localhost:8000` in `.env.local`. For camera/geolocation from phones, use HTTPS or an HTTPS tunnel; a phone cannot reach a computer's `localhost`.
 
 ## IoT hardware module (Raspberry Pi 4)
 
-### Two-bay live occupancy MVP
+### Raspberry Pi all-in-one deployment
 
-The open staff dashboard is at `/admin`; no staff or visitor login is required. **Live bays** shows L1 and L2 as **AVAILABLE**, **OCCUPIED**, **ASSIGNED TO DRIVER**, or **WAITING FOR SENSOR**. It polls `GET /api/bays` every second. Assignment requires a recent confirmed-free sensor reading. A physical occupied reading overrides an assignment. This marker does not identify a driver. Open staff mode grants administrative actions to anyone who can reach the app, so keep it on a trusted LAN or disable it before public deployment.
+The Pi runs the FastAPI backend, SQLite database, built React web app, and GPIO sensor agent. Staff and visitors open the same Pi URL from the local network; the browser uses same-origin API requests. `/admin` is direct-access/no-login as requested. Keep the Pi on a trusted LAN because every reachable staff action is open.
 
-The attached `smartpark_live_mvp.zip` reference files were not present in this workspace, so the implementation uses the current FastAPI/React stack. Device events post to `POST /api/iot/events`; `GET /api/bays` returns the live two-bay state. Sensor transitions are debounced, readings are sequential, boot reconciles initial sensor state, and failed event posts are queued/retried with the original event ID. This phase only initializes L1/L2 sensors. Existing entrance, servo, LEDs, and buzzers are not configured by the MVP loop.
+The physical agent uses BCM pins entrance TRIG 6/ECHO 13, servo 5, L1 TRIG 18/ECHO 17/red 27/green 22/buzzer 26, and L2 TRIG 21/ECHO 20/red 23/green 24/buzzer 19. Sensors are sampled sequentially, classified at 70 cm after debounce and hysteresis. Warning patterns begin below 15 cm and intensify below 5 cm. Startup readings reconcile both bays; stale/failed sensor health displays WAITING FOR SENSOR. Events use a durable JSONL outbox and the same event ID is retained through retries. The backend owns anonymous visitor assignment, parking timers, and GH₵1/minute billing.
 
-For local simulation, start FastAPI and set a provisioned (or local development) `SMARTPARK_DEVICE_TOKEN`, then run:
+The gate opens on a stable entrance approach inside 70 cm and closes only after at least three seconds open plus five consecutive valid readings beyond 80 cm. Missing/ambiguous echoes never count as clear. The pulse values (1.34 ms open and 1.06 ms closed, 50 Hz) are conservative starting values only; calibrate with the servo mechanically disconnected. A software gate opening is not authorization for a public-road barrier or a safety-rated vehicle gate. No Pi hardware has been tested here.
 
-```powershell
-$env:SMARTPARK_API_URL = 'http://127.0.0.1:8000'
-$env:SMARTPARK_DEVICE_TOKEN = 'change-device-token-in-production'
-$env:SMARTPARK_DEVICE_ID = 'pi-two-bay-demo'
-python iot/sensor_agent.py --simulator
-```
+#### Install on Raspberry Pi OS 64-bit
 
-Enter distances at the L1/L2 prompts. `60` represents occupied and `100` represents free. Open the staff app at `http://localhost:5173/admin/bays` directly. The web simulator controls can also mark the sensor state through `POST /api/iot/demo-events`; use the Pi simulator to exercise authenticated device events.
-
-For a Pi and development computer on the same LAN:
-
-1. Find the computer's LAN IPv4 address with `ipconfig` (Windows) or `ip addr` (Linux), such as `192.168.1.20`.
-2. In `backend/.env`, set `SMARTPARK_OPEN_STAFF_INTERFACE=true` and a long random `SMARTPARK_DEVICE_TOKEN`, then restart the backend: `python -m uvicorn app.main:app --app-dir backend --host 0.0.0.0 --port 8000`.
-3. Set `VITE_API_URL=http://192.168.1.20:8000` in the root `.env.local`, then restart Vite with `npm run dev -- --host 0.0.0.0`.
-4. Allow inbound TCP ports 8000 and 5173 on the computer's private LAN firewall profile. Ensure both devices are on the same non-guest network and client isolation is disabled.
-5. Open `http://192.168.1.20:5173/admin` on the computer or phone. Configure facility GPS under **Settings** and the tariff under **Pricing**.
-6. On the Pi, set `SMARTPARK_API_URL=http://192.168.1.20:8000`, `SMARTPARK_DEVICE_ID`, and the matching `SMARTPARK_DEVICE_TOKEN`. Install `requests` and `RPi.GPIO`, then run `python iot/sensor_agent.py`.
-
-The direct staff web interface intentionally has no login. Keep the development app and API on a trusted network; switch `SMARTPARK_OPEN_STAFF_INTERFACE=false` and deploy the existing account flow before exposing the service to an untrusted/public network. The Pi still uses a device token so public visitors cannot forge physical readings.
-
-The example uses plain HTTP for a trusted local demonstration network only. Use HTTPS and a reachable protected API for deployment beyond that network. Protect each 5 V HC-SR04 ECHO line with a resistor divider or 3.3 V level shifter. No physical Pi was tested for this implementation.
-
-The sensor agent supports a software simulator and HC-SR04 sensors on Raspberry Pi OS. It connects to the same FastAPI instance configured by `SMARTPARK_API_URL`; with `VITE_API_URL` set to that backend, accepted device events feed the existing web app availability and operations updates. BCM wiring is fixed in `iot/sensor_agent.py`: entrance TRIG 6/ECHO 13; servo signal GPIO 5; L1 TRIG 18/ECHO 17 with red 27, green 22, buzzer 26; L2 TRIG 21/ECHO 20 with red 23, green 24, buzzer 19. Detection thresholds are 70 cm, close warning below 15 cm, and too-close below 5 cm. Each HC-SR04 ECHO is commonly 5V; use a divider/level shifter before Pi GPIO. Power the servo from a separate regulated supply sized for its stall current, and connect that supply ground to Pi ground. Do not power a servo from a Pi GPIO pin or 3.3V rail. Remove the gate linkage during initial pulse calibration.
-
-```powershell
-$device = @{ device_id='pi-main-gate'; name='Main gate sensor' } | ConvertTo-Json
-Invoke-RestMethod -Method Post http://localhost:8000/api/v1/admin/devices -Headers @{ Authorization='Bearer <admin-access-token>' } -ContentType 'application/json' -Body $device
-```
-
-Revoke a credential with `POST /api/v1/admin/devices/{device_id}/revoke`. Keep the legacy `SMARTPARK_DEVICE_TOKEN` compatibility credential unset in production after all agents have their own provisioned tokens.
+Connect Pi to the same Wi-Fi/Ethernet LAN as phones and staff devices. On the Pi:
 
 ```bash
-python iot/sensor_agent.py --standalone-test
-python iot/sensor_agent.py --simulator
-```
-
-The standalone check exercises the gate state machine without importing GPIO; the simulator currently reports sensor values and heartbeat to the backend. It does not validate hardware. For the real device install `requests` and `RPi.GPIO`, provision a unique device token, and set its environment:
-
-```bash
-python -m venv .venv
+sudo apt update
+sudo apt install -y git python3-venv python3-pip python3-gpiozero nodejs npm
+git clone <your-smartpark-repository-url> ~/smartpark
+cd ~/smartpark
+npm ci
+python3 -m venv .venv
 . .venv/bin/activate
-pip install requests RPi.GPIO
-export SMARTPARK_API_URL=https://your-api.example.com
-export SMARTPARK_DEVICE_ID=pi-main-gate
-export SMARTPARK_DEVICE_TOKEN=replace-with-provisioned-token
-export SMARTPARK_SITE_ID=default
-python iot/sensor_agent.py
+pip install -r backend/requirements.txt requests RPi.GPIO
+cp backend/.env.example backend/.env
 ```
 
-Before attaching the linkage, run the standalone safe test. Then run the Pi agent with the servo arm disconnected, confirm the direction and limited travel, adjust the conservative 1.0–1.4 ms end-stop pulse candidates to the specific servo, and reattach only after the arm clears both stops. Keep people clear of the mechanism. Test each ultrasonic sensor independently, verify ECHO voltage reduction, and confirm the gate stays open through missing/isolated readings and closes only after sustained clear readings. Confirm backend assignment, occupied timer, authorized cash payment and exit through the existing QR → GPS → arrival → parking → cash payment → exit workflow. Raspberry Pi hardware has not been tested as part of this change.
+Set `SMARTPARK_DATABASE_URL=sqlite:////home/<pi-user>/smartpark-data/smartpark.db`, `SMARTPARK_OPEN_STAFF_INTERFACE=true`, `SMARTPARK_DEVICE_TOKEN` to a private random device secret, `SMARTPARK_SITE_ID=default`, and `SMARTPARK_SIMULATOR_ENABLED=true` in `backend/.env`. Keep this token out of browser variables and source control. Build and launch from the repository root:
 
 ```bash
-Bay occupancy events only start a timer for a backend-reserved bay; vacancy events release bays only after the backend has authorized exit. The backend owns assignment and billing. The gate/servo code is not safety-rated and must not be the sole protection for a vehicle or pedestrian barrier.
+VITE_API_URL= npm run build
+set -a; . backend/.env; set +a
+.venv/bin/uvicorn app.main:app --app-dir backend --host 0.0.0.0 --port 8000
+```
+
+Find the Pi LAN address with `hostname -I`, for example `192.168.1.42`. From any device on that same LAN, open `http://192.168.1.42:8000/` for visitors or `/admin` for staff. Use `/visit?facility=default` for QR entry. Configure the facility name/address/coordinates under **Settings** and tariff under **Pricing**. Browser GPS requires HTTPS or localhost; a plain HTTP Pi LAN URL may show destination directions without live browser GPS. Add a trusted local HTTPS certificate/reverse proxy for phone GPS.
+
+#### Start the sensor agent
+
+Use the same environment as the backend so its device token matches:
+
+```bash
+set -a; . backend/.env; set +a
+export SMARTPARK_API_URL=http://127.0.0.1:8000
+export SMARTPARK_DEVICE_ID=pi-main-gate
+export SMARTPARK_OUTBOX_PATH=/home/$USER/smartpark-data/iot-outbox.jsonl
+sudo -E .venv/bin/python iot/sensor_agent.py
+```
+
+`sudo` is used only for direct GPIO access. Both processes and the persistent SQLite/outbox data should start automatically after reboot using systemd services; do not run the agent and server as competing processes that claim the same pins. `GET /api/bays` shows exactly L1 and L2; public bay assignment and staff **Assign L1/Assign L2** require a recent confirmed-free state, and an occupied state overrides assignment. A sensor cannot identify a driver. Sensor vacancy never bypasses staff cash-payment confirmation or the backend’s exit authorization.
+
+#### Wiring and physical test sequence
+
+Each HC-SR04 ECHO output is 5 V; install a resistor divider (for example 1 kΩ from Echo to GPIO and 2 kΩ from GPIO to ground) or a 3.3 V logic shifter. Join sensor ground to Pi ground. Never connect 5 V ECHO directly to a Pi GPIO. Use an external regulated supply sized for the servo stall current; connect servo supply ground to Pi ground, and power the servo from that supply, never the Pi 3.3 V pin or GPIO. Fit a common ground for every sensor/output. Use flyback/driver hardware where the buzzer or indicator load exceeds GPIO current limits.
+
+1. Run `python iot/sensor_agent.py --standalone-test`; it does not import or touch GPIO.
+2. With power off, verify every BCM wire/pin and ECHO divider. Disconnect the servo horn/linkage and test its external supply separately.
+3. Run the Pi backend and `python iot/sensor_agent.py --simulator` to verify the app/backend workflow before connecting real sensors.
+4. Connect one bay sensor at a time, check live health/availability at `/admin/bays`, and test repeated occupied/free readings at distances on both sides of 70 cm.
+5. Confirm 15 cm and 5 cm warning patterns, disconnect/reconnect a sensor and ensure the UI becomes waiting then recovers.
+6. Only after mechanically unloaded pulse measurements and end-stop calibration, reconnect the servo linkage. Verify 5 clear echoes are needed to close and a missing echo never closes the gate.
+7. Test QR entry, GPS from an HTTPS origin, anonymous assignment, server-side timer/billing, cash payment, authorized exit, and sensor-confirmed release.
+
+The standalone checks and simulator are software-only; real GPIO, ultrasonic ranging, voltage levels, warning hardware, servo movement, camera/GPS permissions, and full physical entrance/exit behavior remain to be tested on the Pi.
 
 ## Configuration
 

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { QRCodeSVG } from 'qrcode.react'
 import { CircleMarker, MapContainer, Polyline, Popup, TileLayer, useMap } from 'react-leaflet'
-import { backendEnabled, createAdminUser, createCheckpoint, createVisitorSession, downloadAdminEvents, getAdminAnalytics, getAdminConfig, getAdminEvents, getAdminPublicUrl, saveAdminPublicUrl, getAdminSite, getAdminTariff, getDestination, getParkingAvailability, getPublicLiveAvailability, getPublicCheckpoint, getPublicEntry, getPublicTariff, getSecurityLot, getSecurityQueue, getSessionCharges, getStoredVisitorToken, getVisitorLayout, getVisitorMe, joinVisitorQueue, listAdminUsers, listCheckpoints, requestVisitorExit, saveAdminConfig, saveAdminSite, saveAdminTariff, simulateParkingEvent, storeVisitorToken, verifyVisitorArrival, recordManualPayment, confirmVehicleExit, visitorSocket, getPublicFacility, subscribeNewsletter, unsubscribeNewsletter, getLiveBays, assignOpenBay, assignVisitorBay, assignAnonymousBay, assignOpenVisitorBay, reportDemoBay, getFacilityConfig, type LiveBay, type AdminUser, type QueueRecord, type SiteSettings, type TariffSettings, type VisitorInvoice, type SystemConfig } from './api'
+import { backendEnabled, createAdminUser, createCheckpoint, createVisitorSession, downloadAdminEvents, getAdminAnalytics, getAdminConfig, getAdminEvents, getAdminPublicUrl, saveAdminPublicUrl, getAdminSite, getAdminTariff, getDestination, getParkingAvailability, getPublicLiveAvailability, getPublicCheckpoint, getPublicEntry, getPublicTariff, getSecurityLot, getSecurityQueue, getSessionCharges, getStoredVisitorToken, getVisitorLayout, getVisitorMe, joinVisitorQueue, listAdminUsers, listCheckpoints, requestVisitorExit, saveAdminConfig, saveAdminSite, saveAdminTariff, simulateParkingEvent, storeVisitorToken, verifyVisitorArrival, recordManualPayment, confirmVehicleExit, visitorSocket, getPublicFacility, subscribeNewsletter, unsubscribeNewsletter, getLiveBays, assignOpenBay, assignVisitorBay, reportDemoBay, getFacilityConfig, type BackendSession, type LiveBay, type AdminUser, type QueueRecord, type SiteSettings, type TariffSettings, type VisitorInvoice, type SystemConfig } from './api'
 import {
   ArrowDownRight, ArrowRight, Bell, CarFront, Check, ChevronDown, CircleHelp, Clock3,
   Grid2x2, LayoutDashboard, ListFilter, LogOut, MapPin, Menu, MoreHorizontal, Navigation,
@@ -54,14 +54,12 @@ function staffViewForPath(path: string) {
 const initialSpaces: Space[] = [
   { id: 'L1', status: 'available' },
   { id: 'L2', status: 'available' },
-  { id: 'L3', status: 'available' },
-  { id: 'L4', status: 'available' },
 ]
 
 const initialActivity: Activity[] = [
   { time: '10:24 AM', event: 'Vehicle parked', detail: 'L1 is now occupied', tone: 'green' },
   { time: '10:22 AM', event: 'Vehicle detected', detail: 'Approaching vehicle detected', tone: 'blue' },
-  { time: '10:21 AM', event: 'Space assigned', detail: 'L4 assigned to Visitor #103', tone: 'orange' },
+  { time: '10:21 AM', event: 'Space assigned', detail: 'L2 assigned to visitor', tone: 'orange' },
 ]
 
 const statusLabel: Record<Status, string> = { available: 'Available', reserved: 'Reserved', assigned: 'Reserved for you', occupied: 'Occupied', unavailable: 'Temporarily unavailable', 'out-of-service': 'Out of service' }
@@ -92,6 +90,8 @@ function App() {
   const [mobileOpen, setMobileOpen] = useState(false)
   const [adminView, setAdminView] = useState(() => staffViewForPath(window.location.pathname))
   const [visitorToken, setVisitorToken] = useState<string | null>(null)
+  const [sessionReady, setSessionReady] = useState(false)
+  const visitorSessionRequest = useRef<Promise<BackendSession> | null>(null)
   const [siteName, setSiteName] = useState(() => getDemoSiteSetup()?.name || 'Your Parking Lot')
   const [siteLogo, setSiteLogo] = useState(() => getDemoSiteSetup()?.logo_data_uri || '')
   const [lotConfigured, setLotConfigured] = useState(() => Boolean(getDemoSiteSetup()?.setup_complete))
@@ -116,6 +116,23 @@ function App() {
     if (/^\/(admin|security|guard|reports|login)(\/|$)/.test(window.location.pathname)) setMode('admin')
     else setMode('driver')
     window.scrollTo({ top: 0, behavior: 'smooth' })
+  }
+
+  const createVisitorSessionOnce = (entrySiteId = siteId, entryCheckpoint = checkpointToken) => {
+    if (!visitorSessionRequest.current) {
+      visitorSessionRequest.current = createVisitorSession(entrySiteId, entryCheckpoint || undefined)
+        .then((session) => {
+          storeVisitorToken(session.visitor_token, session.expires_at)
+          setVisitorToken(session.visitor_token)
+          setVisitorSessionId(session.session_id)
+          return session
+        })
+        .catch((error) => {
+          visitorSessionRequest.current = null
+          throw error
+        })
+    }
+    return visitorSessionRequest.current
   }
 
   useEffect(() => {
@@ -221,15 +238,13 @@ function App() {
       }
       if (!token && backendEnabled) {
         try {
-          const session = await createVisitorSession(entrySiteId, checkpointToken || undefined)
+          const session = await createVisitorSessionOnce(entrySiteId, checkpointToken)
           token = session.visitor_token
-          storeVisitorToken(token, session.expires_at)
-          setVisitorToken(token)
-          setVisitorSessionId(session.session_id)
           socket = visitorSocket(token)
           if (socket) socket.onmessage = () => { void refreshBackendState(token!) }
         } catch { setVisitorToken(null) }
       }
+      setSessionReady(true)
       if (token) {
         setVisitorToken(token)
         socket = visitorSocket(token)
@@ -238,7 +253,7 @@ function App() {
     }
     void bootstrap().catch((error) => setCheckpointError(error instanceof Error ? `This entrance QR is invalid or revoked. Ask ParkTech staff for the current checkpoint QR. (${error.message})` : 'This entrance QR is invalid or revoked. Ask ParkTech staff for the current checkpoint QR.'))
     return () => socket?.close()
-  }, [adminPage, adminToken, lotConfigured, siteId, checkpointToken])
+  }, [adminPage, siteId, checkpointToken, lotConfigured])
 
   useEffect(() => {
     if (!backendEnabled || anonymousBay || !visitorToken || !visitorSessionId || !visitorAssignment?.occupied_at) return
@@ -305,17 +320,18 @@ function App() {
     const freeBay = spaces.find((space) => space.status === 'available')
     if (backendEnabled && freeBay) {
       try {
-        const result = visitorToken
-          ? await assignVisitorBay(visitorToken, freeBay.id)
-          : await assignOpenVisitorBay(freeBay.id)
-        const assignedVisitorToken = result.visitor_token || visitorToken
-        if (result.visitor_token) { storeVisitorToken(result.visitor_token); setVisitorToken(result.visitor_token) }
+        let activeVisitorToken = visitorToken
+        if (!activeVisitorToken) {
+          const session = await createVisitorSessionOnce(siteId, checkpointToken)
+          activeVisitorToken = session.visitor_token
+        }
+        const result = await assignVisitorBay(activeVisitorToken, freeBay.id)
         setVisitorSessionId(result.session_id)
         setAnonymousBay(null)
         setReservationMessage(`Bay ${result.space_id} assigned. Use directions to reach the facility.`)
         setVisitorStarted(true)
         setSpaces((current) => current.map((space) => space.id === result.space_id ? { ...space, status: 'assigned', visitor: 'You · Guest' } : space))
-        if (assignedVisitorToken) void refreshBackendState(assignedVisitorToken)
+        void refreshBackendState(activeVisitorToken)
         return
       } catch (error) { setReservationMessage(error instanceof Error ? error.message : 'Could not assign a bay.') }
     } else if (!backendEnabled && freeBay) {
@@ -359,7 +375,7 @@ function App() {
     return <AdminDashboard spaces={spaces} stats={stats} activity={activity} onActivity={setActivity} view={adminView} setView={(view) => { setAdminView(view); navigate(pathForStaffView(view)) }} role={adminRole || 'SECURITY'} onMode={() => { navigate(pathForScreen('home', siteId), true); setAdminToken('open-interface'); setAdminRole('ADMIN'); setMode('driver') }} onSpaces={setSpaces} mobileOpen={mobileOpen} setMobileOpen={setMobileOpen} users={adminUsers} setUsers={setAdminUsers} adminToken={adminToken} siteId={siteId} />
   }
 
-  return <DriverHome screen={driverScreen} onNavigate={(screen) => { const target = pathForScreen(screen, siteId); navigate(`${target}${checkpointToken ? `${target.includes('?') ? '&' : '?'}checkpoint=${encodeURIComponent(checkpointToken)}` : ''}`) }} spaces={spaces} visitorStarted={visitorStarted} visitorTariff={visitorTariff} checkpointError={checkpointError} onGuest={assignNext} reservationMessage={reservationMessage} canReserve={!backendEnabled || availabilityState === 'live'} onOccupy={occupyAssigned} onRequestExit={exitRequest} onPayDemo={payInvoice} invoice={visitorInvoice} billingMessage={billingMessage} availabilityState={availabilityState} mobileOpen={mobileOpen} setMobileOpen={setMobileOpen} siteName={siteName} siteLogo={siteLogo} installPrompt={installPrompt} destination={destination} lotConfigured={lotConfigured} assignment={visitorAssignment} estimate={chargeEstimate} />
+  return <DriverHome screen={driverScreen} onNavigate={(screen) => { const target = pathForScreen(screen, siteId); navigate(`${target}${checkpointToken ? `${target.includes('?') ? '&' : '?'}checkpoint=${encodeURIComponent(checkpointToken)}` : ''}`) }} spaces={spaces} visitorStarted={visitorStarted} visitorTariff={visitorTariff} checkpointError={checkpointError} onGuest={assignNext} reservationMessage={reservationMessage} canReserve={!backendEnabled || availabilityState === 'live'} sessionReady={sessionReady} onOccupy={occupyAssigned} onRequestExit={exitRequest} onPayDemo={payInvoice} invoice={visitorInvoice} billingMessage={billingMessage} availabilityState={availabilityState} mobileOpen={mobileOpen} setMobileOpen={setMobileOpen} siteName={siteName} siteLogo={siteLogo} installPrompt={installPrompt} destination={destination} lotConfigured={lotConfigured} assignment={visitorAssignment} estimate={chargeEstimate} />
 }
 
 function pathForStaffView(view: string) {
@@ -407,11 +423,11 @@ function Brand({ compact = false, logoUrl }: { compact?: boolean; logoUrl?: stri
   return <div className={`brand ${compact ? 'brand-compact' : ''}`}>{logoUrl ? <img className="brand-logo-image" src={logoUrl} alt="Facility logo" /> : <span className="brand-mark"><CarFront size={compact ? 17 : 20} strokeWidth={2.5} /></span>}<span>Smart <span>Park</span></span></div>
 }
 
-function DriverHome({ screen, onNavigate, spaces, visitorStarted, visitorTariff, checkpointError, onGuest, reservationMessage, canReserve, onOccupy, onRequestExit, onPayDemo, invoice, billingMessage, availabilityState, mobileOpen, setMobileOpen, siteName, siteLogo, installPrompt, destination, lotConfigured, assignment, estimate }: { screen: DriverScreen; onNavigate: (screen: DriverScreen) => void; spaces: Space[]; visitorStarted: boolean; visitorTariff: TariffSettings | null; checkpointError: string; onGuest: () => void; reservationMessage: string; canReserve: boolean; onOccupy: () => void; onRequestExit: () => void; onPayDemo: () => void; invoice: VisitorInvoice | null; billingMessage: string; availabilityState: 'demo' | 'loading' | 'live' | 'error'; mobileOpen: boolean; setMobileOpen: (value: boolean) => void; siteName: string; siteLogo: string; installPrompt: BeforeInstallPromptEvent | null; destination: CampusDestination | null; lotConfigured: boolean; assignment: { id: string; space_id: string; status: string; created_at: string; occupied_at: string | null } | null; estimate: { duration_minutes: number; amount_minor: number; currency: string; tariff: { free_minutes: number; block_minutes: number; block_price_minor: number } } | null }) {
+function DriverHome({ screen, onNavigate, spaces, visitorStarted, visitorTariff, checkpointError, onGuest, reservationMessage, canReserve, sessionReady, onOccupy, onRequestExit, onPayDemo, invoice, billingMessage, availabilityState, mobileOpen, setMobileOpen, siteName, siteLogo, installPrompt, destination, lotConfigured, assignment, estimate }: { screen: DriverScreen; onNavigate: (screen: DriverScreen) => void; spaces: Space[]; visitorStarted: boolean; visitorTariff: TariffSettings | null; checkpointError: string; onGuest: () => void; reservationMessage: string; canReserve: boolean; sessionReady: boolean; onOccupy: () => void; onRequestExit: () => void; onPayDemo: () => void; invoice: VisitorInvoice | null; billingMessage: string; availabilityState: 'demo' | 'loading' | 'live' | 'error'; mobileOpen: boolean; setMobileOpen: (value: boolean) => void; siteName: string; siteLogo: string; installPrompt: BeforeInstallPromptEvent | null; destination: CampusDestination | null; lotConfigured: boolean; assignment: { id: string; space_id: string; status: string; created_at: string; occupied_at: string | null } | null; estimate: { duration_minutes: number; amount_minor: number; currency: string; tariff: { free_minutes: number; block_minutes: number; block_price_minor: number } } | null }) {
   const assigned = spaces.find((space) => space.visitor === 'You · Guest')
   const full = lotConfigured && availabilityState !== 'loading' && availabilityState !== 'error' && !spaces.some((space) => space.status === 'available') && !assigned
   const install = async () => { if (!installPrompt) return; await installPrompt.prompt() }
-  if (screen !== 'home') return <DriverRoute screen={screen} onNavigate={onNavigate} spaces={spaces} assigned={assigned} full={full} visitorStarted={visitorStarted} checkpointError={checkpointError} onGuest={onGuest} reservationMessage={reservationMessage} canReserve={canReserve} onOccupy={onOccupy} onRequestExit={onRequestExit} onPayDemo={onPayDemo} invoice={invoice} billingMessage={billingMessage} availabilityState={availabilityState} siteName={siteName} siteLogo={siteLogo} destination={destination} lotConfigured={lotConfigured} assignment={assignment} estimate={estimate} visitorTariff={visitorTariff} />
+  if (screen !== 'home') return <DriverRoute screen={screen} onNavigate={onNavigate} spaces={spaces} assigned={assigned} full={full} visitorStarted={visitorStarted} checkpointError={checkpointError} onGuest={onGuest} reservationMessage={reservationMessage} canReserve={canReserve} sessionReady={sessionReady} onOccupy={onOccupy} onRequestExit={onRequestExit} onPayDemo={onPayDemo} invoice={invoice} billingMessage={billingMessage} availabilityState={availabilityState} siteName={siteName} siteLogo={siteLogo} destination={destination} lotConfigured={lotConfigured} assignment={assignment} estimate={estimate} visitorTariff={visitorTariff} />
   return <div className="driver-shell">
     <header className="site-nav"><Brand logoUrl={siteLogo} /><nav className={mobileOpen ? 'nav-links mobile-nav-open' : 'nav-links'}><a href="#how" onClick={() => setMobileOpen(false)}>How it works</a><a href="#features" onClick={() => setMobileOpen(false)}>Features</a><a href="#about" onClick={() => setMobileOpen(false)}>About us</a><a href="/install" onClick={() => setMobileOpen(false)}>Install app</a></nav><div className="nav-actions"><button className="icon-button mobile-menu" onClick={() => setMobileOpen(!mobileOpen)} aria-label="Toggle navigation">{mobileOpen ? <X size={21} /> : <Menu size={21} />}</button></div></header>
     <main>{installPrompt && !visitorStarted && <div className="install-notice"><Sparkles size={15} /><span>SmartPark works in your browser. Installation is optional.</span><button onClick={install}>Add to Home Screen</button></div>}
@@ -460,7 +476,7 @@ function PublicInfoPage({ path, onHome }: { path: string; onHome: () => void }) 
   return <div className="public-info-shell"><header><button className="brand-button" onClick={onHome}><Brand /></button><a className="button button-secondary" href="/admin">Staff dashboard</a></header><main><span className="eyebrow">ParkTech visitor information</span><h1>{title[path]}</h1>{path === '/unsubscribe' ? <p role="status">{message}</p> : <p>{copy[path]}</p>}</main><Footer siteName="Smart Park" siteLogo="" compact /></div>
 }
 
-function DriverRoute({ screen, onNavigate, spaces, assigned, full, visitorStarted, checkpointError, onGuest, reservationMessage, canReserve, onOccupy, onRequestExit, onPayDemo, invoice, billingMessage, availabilityState, siteName, siteLogo, destination, lotConfigured, assignment, estimate, visitorTariff }: { screen: DriverScreen; onNavigate: (screen: DriverScreen) => void; spaces: Space[]; assigned?: Space; full: boolean; visitorStarted: boolean; checkpointError: string; onGuest: () => void; reservationMessage: string; canReserve: boolean; onOccupy: () => void; onRequestExit: () => void; onPayDemo: () => void; invoice: VisitorInvoice | null; billingMessage: string; availabilityState: 'demo' | 'loading' | 'live' | 'error'; siteName: string; siteLogo: string; destination: CampusDestination | null; lotConfigured: boolean; assignment: { id: string; space_id: string; status: string; created_at: string; occupied_at: string | null } | null; estimate: { duration_minutes: number; amount_minor: number; currency: string; tariff: { free_minutes: number; block_minutes: number; block_price_minor: number } } | null; visitorTariff: TariffSettings | null }) {
+function DriverRoute({ screen, onNavigate, spaces, assigned, full, visitorStarted, checkpointError, onGuest, reservationMessage, canReserve, sessionReady, onOccupy, onRequestExit, onPayDemo, invoice, billingMessage, availabilityState, siteName, siteLogo, destination, lotConfigured, assignment, estimate, visitorTariff }: { screen: DriverScreen; onNavigate: (screen: DriverScreen) => void; spaces: Space[]; assigned?: Space; full: boolean; visitorStarted: boolean; checkpointError: string; onGuest: () => void; reservationMessage: string; canReserve: boolean; sessionReady: boolean; onOccupy: () => void; onRequestExit: () => void; onPayDemo: () => void; invoice: VisitorInvoice | null; billingMessage: string; availabilityState: 'demo' | 'loading' | 'live' | 'error'; siteName: string; siteLogo: string; destination: CampusDestination | null; lotConfigured: boolean; assignment: { id: string; space_id: string; status: string; created_at: string; occupied_at: string | null } | null; estimate: { duration_minutes: number; amount_minor: number; currency: string; tariff: { free_minutes: number; block_minutes: number; block_price_minor: number } } | null; visitorTariff: TariffSettings | null }) {
   const heading: Record<DriverScreen, string> = { home: 'Parking', welcome: 'Welcome', availability: 'Live availability', navigate: 'Directions', 'my-space': 'My parking space', session: 'Active session', payment: 'Demo payment', receipt: 'Receipt', scan: 'Checkpoint', install: 'Install SmartPark' }
   return <div className="driver-shell driver-route-shell">
     <header className="site-nav route-nav"><button className="brand-button" onClick={() => onNavigate('home')} aria-label="Smart Park home"><Brand logoUrl={siteLogo} /></button><span className="route-site-name">{siteName}</span><a className="route-help" href="/install">Install</a></header>
@@ -468,7 +484,7 @@ function DriverRoute({ screen, onNavigate, spaces, assigned, full, visitorStarte
       <div className="route-breadcrumb"><button onClick={() => onNavigate('home')}>Home</button><span>/</span><strong>{heading[screen]}</strong></div>
       {checkpointError && <p className="login-error" role="alert">{checkpointError}</p>}
       {screen === 'welcome' && <section className="route-card welcome-card"><span className="eyebrow">ParkTech parking · {availabilityState === 'live' ? 'live' : 'offline'}</span><h1>Welcome to<br /><em>{siteName}</em></h1><p>Spaces available: <strong>{spaces.filter((space) => space.status === 'available').length} of {spaces.length}</strong>. Check bay sensors, choose an available space, and follow GPS directions to the lot.</p><div className="availability-legend"><span><i className="legend-dot available-dot" /> Available</span><span><i className="legend-dot assigned-dot" /> Reserved</span><span><i className="legend-dot occupied-dot" /> Occupied</span><span><i className="legend-dot unavailable-dot" /> Unknown</span></div>{visitorTariff && <p className="route-copy">Parking charges: first {visitorTariff.free_minutes} minutes free, then GH₵{(visitorTariff.block_price_minor / 100).toFixed(2)} per {visitorTariff.block_minutes} minutes. Times use Africa/Accra.</p>}<div className="privacy-note"><ShieldCheck size={17} /> No driver account required. GPS stays on your device unless you choose live navigation.</div><div className="route-actions"><button className="button button-primary" onClick={() => onNavigate('navigate')}>Get directions <ArrowRight size={16} /></button><button className="button button-secondary" onClick={() => onNavigate('availability')}>Check availability</button></div><p className="form-help">Park only in the space assigned to you by staff and follow posted signs.</p></section>}
-      {screen === 'availability' && <section className="route-panel"><div className="route-panel-heading"><div><span className="eyebrow">{availabilityState === 'live' ? 'Live status' : availabilityState === 'error' ? 'Connection problem' : 'Checking spaces'}</span><h1>Choose an available space</h1></div><span className="availability-count">{spaces.filter((space) => space.status === 'available').length} / {spaces.length} available</span></div><p className="route-copy">Availability is updated from the two live bay sensors. You can request an assignment for any confirmed-free bay.</p><ParkingMap spaces={spaces} highlight={assigned?.id} /><div className="route-actions"><button className="button button-primary" disabled={!assigned} onClick={() => onNavigate('my-space')}>VIEW MY BAY <ArrowRight size={16} /></button><p className="route-warning">Choose a confirmed-free bay and use GPS directions to reach the facility.</p></div>{reservationMessage && <p className="gps-message" role="alert">{reservationMessage}</p>}{full && <p className="gps-message" role="status">No bays are free right now. You can join the queue and Smart Park will check again.</p>}</section>}
+      {screen === 'availability' && <section className="route-panel"><div className="route-panel-heading"><div><span className="eyebrow">{availabilityState === 'live' ? 'Live status' : availabilityState === 'error' ? 'Connection problem' : 'Checking spaces'}</span><h1>Choose an available space</h1></div><span className="availability-count">{spaces.filter((space) => space.status === 'available').length} / {spaces.length} available</span></div><p className="route-copy">Availability is updated from the two live bay sensors. A request reserves the next sensor-confirmed free bay for this visit.</p><ParkingMap spaces={spaces} highlight={assigned?.id} /><div className="route-actions"><button className="button button-primary" disabled={Boolean(assigned) || availabilityState !== 'live' || !sessionReady || !spaces.some((space) => space.status === 'available')} onClick={() => onGuest()}>{assigned ? `ASSIGNED TO ${bayLabel(assigned.id)}` : !sessionReady ? 'PREPARING VISITOR SESSION' : 'REQUEST A FREE BAY'} <ArrowRight size={16} /></button><button className="button button-secondary" disabled={!assigned} onClick={() => onNavigate('my-space')}>VIEW MY BAY</button><p className="route-warning">Use GPS directions to reach the facility. The bay sensor confirms when you park.</p></div>{reservationMessage && <p className="gps-message" role="alert">{reservationMessage}</p>}{full && <p className="gps-message" role="status">No bays are free right now. Ask staff for help.</p>}</section>}
       {screen === 'navigate' && <section className="route-panel"><div className="route-panel-heading"><div><span className="eyebrow">Waiting for parking entrance detection</span><h1>{assigned ? `DRIVE TO BAY ${bayLabel(assigned.id)}` : 'Find your parking'}</h1></div><span className="status-chip">{destination?.latitude !== null && destination?.latitude !== undefined ? 'Directions ready' : 'Address not set'}</span></div>{!assigned && <p className="route-warning">Use GPS directions to reach the facility entrance, then confirm your bay with staff.</p>}{reservationMessage && <p className="gps-message" role="status">{reservationMessage}</p>}<CampusMapCard destination={destination} /><div className="route-actions"><button className="button button-primary" onClick={() => onNavigate('my-space')}>View my parking space <ArrowRight size={16} /></button><button className="button button-secondary" onClick={() => onNavigate('availability')}>Availability</button></div></section>}
       {screen === 'my-space' && <section className="route-panel"><div className="route-panel-heading"><div><span className="eyebrow">Final approach</span><h1>Your assigned parking space</h1></div></div>{assigned || assignment ? <DriverFlow spaces={spaces} assigned={assigned} full={full} siteName={siteName} onOccupy={onOccupy} onRequestExit={onRequestExit} onPayDemo={onPayDemo} invoice={invoice} billingMessage={billingMessage} /> : <div className="route-empty"><h2>You have not reserved a bay yet.</h2><p>Check availability and reserve when you arrive at the checkpoint.</p><button className="button button-primary" onClick={() => onNavigate('availability')}>Check availability</button></div>}<div className="route-actions"><button className="button button-secondary" onClick={() => onNavigate(assignment?.occupied_at ? 'session' : 'navigate')}>{assignment?.occupied_at ? 'View active session' : 'View directions'}</button></div></section>}
       {screen === 'session' && <ParkingSessionScreen assignment={assignment} estimate={estimate} siteName={siteName} onRequestExit={onRequestExit} invoice={invoice} message={billingMessage} />}
@@ -531,11 +547,11 @@ function CampusMapCard({ destination }: { destination: CampusDestination | null 
   const [online, setOnline] = useState(navigator.onLine)
   const destinationPosition: [number, number] = [destination?.latitude ?? 0, destination?.longitude ?? 0]
   useEffect(() => {
-    if (!backendEnabled || destination?.latitude) return
+    if (!backendEnabled || destination?.latitude !== null && destination?.latitude !== undefined) return
     void getFacilityConfig().then((site) => {
       if (site.latitude !== null && site.longitude !== null) window.dispatchEvent(new CustomEvent('smartpark:facility-coordinates', { detail: site }))
     }).catch(() => undefined)
-  }, [destination?.latitude])
+  }, [backendEnabled, destination?.latitude])
   const internalWaypoints: [number, number][] = destination?.waypoints?.map((point) => [point.latitude, point.longitude]) || []
   const routePoints: [number, number][] = roadRoute || (position ? [position, ...internalWaypoints, destinationPosition] : (internalWaypoints.length ? internalWaypoints : [destinationPosition]))
   useEffect(() => {

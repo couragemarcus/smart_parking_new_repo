@@ -4,9 +4,9 @@
 
 ```mermaid
 flowchart LR
-  Phone[Visitor phone] -->|public HTTPS QR URL| PWA[React visitor PWA]
+  Phone[Visitor phone] -->|direct public QR URL| PWA[React visitor PWA]
   PWA -->|REST + private WebSocket| API[FastAPI service]
-  Security[Security/Admin browser] -->|protected REST + operations WebSocket| API
+  Staff[Open staff browser] -->|direct REST + operations updates| API
   Pi[Raspberry Pi 4 sensor agent] -->|device-authenticated events| API
   API --> DB[(SQLite local / PostgreSQL production)]
   PWA -->|OpenStreetMap tiles| Map[Leaflet campus map]
@@ -30,7 +30,7 @@ Allocation is lowest-numbered available bay first. SQLite uses a process lock fo
 
 ## Privacy boundaries
 
-Visitor tokens are opaque and stored only as hashes in the backend. Each entrance QR contains a signed checkpoint identifier, not visitor identity. A separate six-digit arrival code is hashed at rest and shown only to the visitor at session creation; security must verify it before allocation. A visitor receives their own assignment through `/visitor/me`, `/visitor/assignment`, and the visitor WebSocket. Security and administrators receive the aggregate operational lot state.
+Visitor sessions are passwordless: an opaque token, stored only as a hash in the backend, scopes one browser's assignment, timer, and billing. The current QR is a direct public URL and contains no signed checkpoint credential. Staff access is open by default. Raspberry Pi device events still require the device token; device liveness alone does not assert bay sensor health, which is reported per sensor.
 
 The entrance sensor is an approach signal. It cannot identify a visitor or determine which bay is occupied. Security matching or per-bay sensors are required before changing a reservation to occupied.
 
@@ -38,11 +38,11 @@ The entrance sensor is an approach signal. It cannot identify a visitor or deter
 
 - Visitor welcome: facility name/logo, live space states, public pricing, entrance checkpoint session, opt-in PWA install prompt.
 - GPS card: Leaflet/OpenStreetMap, opt-in foreground geolocation, OSRM-compatible routed path with distance/ETA, and Google Maps fallback. Smart Park does not store visitor coordinates; the opted-in routing provider receives the current and destination coordinates.
-- Parking schematic: one access road on the left and L1-L4 vertically on the right.
-- Assignment state: only the visitor's bay pulses green after an attendant verifies the arrival code; confirmed occupancy changes it to red.
-- Separate `/admin` email/password login route. Staff API and operations WebSocket enforce role permissions; visitor navigation contains no administrator menu.
-- Security dashboard: live lot, code verification for arrivals, checkpoint QR print, activity feed, sensor simulator controls.
-- User management: protected account creation and roster.
+- Parking schematic: two instrumented bays, L1 and L2, with sensor health, available, assigned, and occupied states.
+- Assignment state: staff or a passwordless visitor can reserve only a recently confirmed free bay; physical occupancy overrides assignment.
+- `/admin` opens directly without a staff login in the default configuration.
+- Staff dashboard: live bays, settings, activity, payments, simulator, and direct QR entry URL.
+- Visitor interface: public availability, opt-in GPS directions, assigned bay, backend timer, and manual payment/exit guidance.
 
 ## Runtime modes
 
@@ -52,8 +52,8 @@ No `VITE_API_URL`. State is held in React and resets with a full page reload. Th
 
 ### API mode
 
-Set `VITE_API_URL`. Visitor sessions, destinations, assignments, account access, and private events are provided by FastAPI. The frontend does not fabricate assignments after a successful backend response.
+Set `VITE_API_URL`. Visitor sessions, destinations, sensor state, assignments, billing, and private visitor events come from FastAPI. The frontend does not fabricate assignments after a successful backend response.
 
 ### Hardware mode
 
-Run the IoT agent with a device token. It sends idempotent events with a unique event id. The backend ignores duplicates and broadcasts accepted state changes to authorized subscribers.
+On a Raspberry Pi deployment, FastAPI serves the built React app, SQLite, and authenticated device API from one origin. The Pi agent reads entrance and L1/L2 sequentially, sends debounced idempotent events through a durable outbox, reports sensor health, and controls the assigned GPIO indicators and conservatively configured servo state machine. The backend ignores duplicate events, remains authoritative for assignments/timers/billing, and exposes current bay state to the visitor and open staff interfaces. Physical GPIO and servo behavior must be tested on the target Pi.

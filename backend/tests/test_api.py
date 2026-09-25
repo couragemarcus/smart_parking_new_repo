@@ -148,6 +148,19 @@ def test_public_passwordless_assignment_creates_billable_visitor_session():
     assert client.get("/api/v1/visitor/me", headers=visitor_headers).json()["status"] == "PARKED"
 
 
+def test_device_heartbeat_reports_sensor_health_without_trusting_device_liveness():
+    reset_default_lot()
+    device_headers = {"x-device-token": "change-device-token-in-production"}
+    free = {"event_id": "heartbeat-health-free-01", "device_id": "pi-health", "sensor_id": "L1", "space_id": "L1", "event_type": "bay_free"}
+    assert client.post("/api/iot/events", headers=device_headers, json=free).status_code == 200
+    assert next(bay for bay in client.get("/api/bays").json()["bays"] if bay["id"] == "L1")["display_state"] == "AVAILABLE"
+    heartbeat = client.post("/api/v1/iot/heartbeat?device_id=pi-health", headers=device_headers, json={"sensors": {"L1": False}})
+    assert heartbeat.status_code == 200
+    assert heartbeat.json()["status"] == "online"
+    assert next(bay for bay in client.get("/api/bays").json()["bays"] if bay["id"] == "L1")["display_state"] == "WAITING_FOR_SENSOR"
+    assert client.post("/api/v1/iot/heartbeat?device_id=pi-health", headers=device_headers, json={"sensors": {"L3": True}}).status_code == 422
+
+
 def test_open_staff_interface_no_login_and_iot_still_requires_device_token():
     import app.main as main_module
     main_module.OPEN_STAFF_INTERFACE = True
@@ -178,6 +191,19 @@ def test_direct_staff_interface_and_public_sensor_availability():
     assert client.get("/api/v1/admin/tariff").status_code == 200
     assert client.post("/api/v1/admin/login", json={"email": "anyone@example.test", "password": "unused"}).json()["access_token"] == "open-interface"
     main_module.OPEN_STAFF_INTERFACE = False
+
+
+def test_live_bay_availability_respects_facility_setup_state():
+    with connect() as db:
+        db.execute("UPDATE sites SET setup_complete=0 WHERE id='default'")
+    try:
+        response = client.get("/api/public/live-availability")
+        assert response.status_code == 200
+        assert response.json()["configured"] is False
+        assert [space["id"] for space in response.json()["spaces"]] == ["L1", "L2"]
+    finally:
+        with connect() as db:
+            db.execute("UPDATE sites SET setup_complete=1 WHERE id='default'")
 
 
 def test_visitor_cannot_read_admin_lot():
@@ -359,8 +385,9 @@ def test_public_availability_exposes_only_status_and_total():
     response = client.get("/api/v1/sites/default/availability")
     assert response.status_code == 200
     data = response.json()
-    assert data["total"] == 4
-    assert data["available"] + data["reserved"] + data["occupied"] + data["unavailable"] + data["out_of_service"] == 4
+    assert data["total"] == 2
+    assert [space["id"] for space in data["spaces"]] == ["L1", "L2"]
+    assert data["available"] + data["reserved"] + data["occupied"] + data["unavailable"] + data["out_of_service"] == 2
     assert all(set(space) == {"id", "status"} for space in data["spaces"])
     assert all("session" not in key and "visitor" not in key for space in data["spaces"] for key in space)
     assert client.get("/api/v1/sites/unknown/availability").status_code == 404

@@ -10,7 +10,7 @@ Visitor routes use:
 X-Visitor-Token: <opaque visitor token>
 ```
 
-Admin/security routes use either the local bootstrap token or an expiring login token:
+The staff interface is direct access by default (`SMARTPARK_OPEN_STAFF_INTERFACE=true`), so staff API routes do not require a login in this mode. If the flag is disabled, staff routes use the existing bearer-token account flow:
 
 ```text
 Authorization: Bearer <admin token>
@@ -29,9 +29,11 @@ X-Device-Token: <device token>
 | `GET` | `/health` | Service health |
 | `GET` | `/api/public/sites/{site_id}/entry` | Public QR entry metadata |
 | `GET` | `/api/public/sites/{site_id}/qr?format=svg\|png` | Public reusable QR artifact |
-| `GET` | `/api/v1/public/checkpoints/{signed_token}` | Validate an active checkpoint and show public facility/space details |
+| `GET` | `/api/v1/public/checkpoints/{signed_token}` | Legacy signed-checkpoint validation endpoint; the current public QR does not use it |
 | `GET` | `/api/v1/sites/{site_id}/destination` | Configured coordinates, waypoints, Google Maps link |
 | `GET` | `/api/v1/sites/{site_id}/availability` | Public totals and generic available/reserved/occupied states; no visitor identifiers |
+| `GET` | `/api/public/live-availability` | Current two-bay sensor state for the visitor interface |
+| `GET` | `/api/public/facility-config` | Public GPS destination coordinates |
 | `GET` | `/api/v1/sites/{site_id}/tariff` | Publicly displayed facility rate |
 | `GET` | `/api/parking/availability?site_id=default` | Compatibility availability route |
 
@@ -39,9 +41,11 @@ X-Device-Token: <device token>
 
 | Method | Route | Purpose |
 |---|---|---|
-| `POST` | `/api/v1/visitor/sessions?checkpoint_token=...` | Create a new isolated session with random token and visitor-only arrival code; rate limited |
+| `POST` | `/api/v1/visitor/sessions?site_id=default` | Create a private passwordless visitor session with an opaque token; rate limited |
 | `GET` | `/api/v1/visitor/me` | Read own session, reservation, and invoice for refresh recovery |
-| `POST` | `/api/v1/visitor/arrivals` | Check in; does not allocate a bay until security verifies the visitor code |
+| `POST` | `/api/public/visitor/assign` | Assign this visitor to a selected bay after recent sensor-confirmed vacancy |
+| `POST` | `/api/public/assign-visitor-bay` | Create a passwordless session and reserve a sensor-confirmed free bay |
+| `POST` | `/api/v1/visitor/arrivals` | Legacy arrival check-in route |
 | `GET` | `/api/v1/visitor/parking-layout` | Privacy-safe layout with `is_mine` marker |
 | `GET` | `/api/v1/visitor/assignment` | Read current private assignment |
 | `POST` | `/api/v1/visitor/vehicle` | Store visitor-entered plate as hash plus last four characters |
@@ -52,7 +56,7 @@ X-Device-Token: <device token>
 | `WS` | `/api/v1/ws/visitor?token=...` | Private visitor events |
 
 Compatibility aliases exist for `/api/visitor/sessions`, `/api/visitor/arrived`, and `/api/parking/destination`.
-The printed QR opens `/enter/{checkpoint-id}.{signature}`. Tokens are signed using `SMARTPARK_CHECKPOINT_SECRET`; replacing a checkpoint requires explicit confirmation and revokes the previous link. Each scan creates a distinct visitor session. Legacy `/scan/{site_id}` and `/visit/{site_id}` routes remain for local compatibility. Private visitor state requires an unexpired visitor token.
+The current printed QR opens a plain `/visit?facility=default` URL. It does not require a signed checkpoint token. Opening the visitor app creates a private passwordless session; the opaque visitor token scopes assignment, timer, and billing state to that browser. Legacy signed-checkpoint routes remain available for compatibility but are not part of the normal visitor path.
 
 ## Admin and security routes
 
@@ -64,7 +68,7 @@ The printed QR opens `/enter/{checkpoint-id}.{signature}`. Tokens are signed usi
 | `GET` | `/api/v1/security/lot` | Full live lot state and counts |
 | `GET` | `/api/v1/security/arrivals` | Waiting/assigned visitor queue |
 | `GET` | `/api/v1/security/queue` | Active arrival, parking, and exit lifecycle queue |
-| `POST` | `/api/v1/security/arrivals/{session_id}/verify` | Verify the visitor's six-digit code; only then assign the first available bay |
+| `POST` | `/api/v1/security/arrivals/{session_id}/verify` | Legacy check-in matching route; current visitors request a sensor-confirmed bay directly |
 | `GET` | `/api/v1/admin/checkpoints` | List checkpoint entry URLs for authorized staff |
 | `POST` | `/api/v1/admin/checkpoints` | Create/replace the entrance QR; replacement needs explicit confirmation |
 | `GET` | `/api/v1/admin/events` | Audit events |
@@ -81,7 +85,7 @@ The printed QR opens `/enter/{checkpoint-id}.{signature}`. Tokens are signed usi
 | `GET` | `/api/v1/admin/sites/{site_id}/qr` | Protected SVG/PNG QR download |
 | `WS` | `/api/v1/ws/operations?authorization=...` | Authorized operations events |
 
-Role permissions are checked server-side: `SECURITY` can view operations/arrivals and checkpoint QR, verify visitor codes, use the simulator, and authorize exits; `MANAGER` can view operations, arrivals, checkpoints, and reports; `ADMIN` can manage users, checkpoints, facility settings, tariffs, devices, and configuration. Requests without a valid login/bootstrap token receive `401`; authenticated users missing the required role receive `403`.
+With the default open staff setting, staff can use `/admin` and its API directly without a login. This grants administrative actions to anyone who can reach the service; keep it on a trusted LAN. Setting `SMARTPARK_OPEN_STAFF_INTERFACE=false` restores the existing login and role checks.
 
 ## IoT and simulator routes
 
@@ -92,13 +96,15 @@ Role permissions are checked server-side: `SECURITY` can view operations/arrival
 | `POST` | `/api/v1/simulator/events` | Development-only event using same event logic |
 | `POST` | `/api/iot/events` | Authenticated, idempotent L1/L2 occupancy event for the two-bay live MVP |
 | `GET` | `/api/bays` | Public latest L1/L2 physical/sensor-health state |
-| `POST` | `/api/v1/security/bays/{space_id}/assignment` | Staff-only demo assignment for a confirmed-free bay |
+| `POST` | `/api/v1/iot/heartbeat?device_id=...` | Authenticated device heartbeat with per-sensor health map |
+| `POST` | `/api/bays/{space_id}/assignment` | Direct staff assignment for a recently confirmed-free bay |
+| `POST` | `/api/iot/demo-events` | Simulator-only bay occupancy transition |
 
 The IoT endpoint accepts the versioned event envelope `{event_id, facility_id, device_id, space_id, measured_at, event_type, payload}` and retains compatibility with the original `sensor_id` and `observed_at` fields. `bay_occupied` (or compatibility alias `space_occupied`) starts the backend session timer once. `bay_vacant` (or `space_vacant`) releases a space only after an authorized exit. `vehicle_detected`, `gate_opened`, `gate_closed`, and `device_heartbeat` are accepted as device events; sensor events never select a visitor or bay assignment. Events are deduplicated by `event_id`. Administrators provision per-device tokens with `POST /api/v1/admin/devices`; the returned token is shown once and must be stored securely. The configured shared token remains as a transition credential for existing deployments and should be unset after devices migrate. This is a single-facility deployment; multi-tenant isolation is out of scope.
 
 ## DEMO tariff and lifecycle
 
-The editable seed assumption is 30 free minutes, then GHS 2 per started 10-minute block (200 pesewas), with zero grace and no daily cap. `PATCH /api/v1/admin/tariff` changes future invoices; each invoice stores a tariff snapshot. The `amount_minor` field is in the currency's minor unit. Payments are `DEMO_PAID` records only. Visitors may request the invoice and make the demo payment; staff authorize the simulated exit. The space remains occupied until a vacancy event arrives.
+The default tariff is GH₵1 per minute: zero free minutes, one-minute billing blocks, and 100 pesewas per block. Staff can edit rates at `/admin/pricing`; each invoice stores a tariff snapshot. Manual staff payment records support cash and other offline methods. The separately labelled demo-payment route is simulated and never transfers money. A bay stays occupied until staff authorizes exit and the sensor confirms vacancy.
 
 Typical event types include `vehicle_detected`, `space_occupied`, `space_released`, `device_offline`, and `device_online`.
 

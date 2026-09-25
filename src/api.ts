@@ -6,7 +6,8 @@ export type BackendSession = {
   expires_at: string
 }
 
-const apiUrl = (import.meta.env.VITE_API_URL as string | undefined)?.replace(/\/$/, '')
+const configuredApiUrl = (import.meta.env.VITE_API_URL as string | undefined)?.trim().replace(/\/$/, '')
+const apiUrl = configuredApiUrl || (import.meta.env.DEV ? '' : window.location.origin)
 
 export const backendEnabled = Boolean(apiUrl)
 export const visitorTokenKey = 'smartpark.visitor.token'
