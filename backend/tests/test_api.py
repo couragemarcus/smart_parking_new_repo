@@ -15,6 +15,11 @@ sys.path.insert(0, str(Path(__file__).parents[1]))
 
 from fastapi.testclient import TestClient
 from app.main import ADMIN_TOKEN, SETUP_TOKEN, app, connect, fee_quote, init_db
+import app.main as main_module
+from datetime import timezone
+
+_server_now = main_module.now
+main_module.now = lambda: datetime.now(timezone.utc).isoformat()
 
 init_db()
 with connect() as db:
@@ -38,6 +43,11 @@ def reset_default_lot():
             db.executemany("DELETE FROM invoices WHERE session_id = ?", [(session_id,) for session_id in active_ids])
             db.executemany("DELETE FROM visitor_sessions WHERE id = ?", [(session_id,) for session_id in active_ids])
         db.execute("UPDATE parking_spaces SET status = 'AVAILABLE', assigned_session = NULL, vehicle_id = NULL WHERE site_id = 'default'")
+        db.execute("DELETE FROM iot_events")
+        db.execute("UPDATE bay_sensor_state SET physical_state = 'UNKNOWN', device_id = NULL, last_seen = NULL, updated_at = ?", (datetime.now(timezone.utc).isoformat(),))
+        db.execute("DELETE FROM demo_bay_assignments")
+        db.execute("DELETE FROM reservations")
+        db.execute("DELETE FROM visitor_sessions WHERE site_id = 'default'")
 
 
 def test_first_parktech_admin_can_create_account_once():
@@ -81,6 +91,7 @@ def test_duplicate_iot_events_are_idempotent():
 
 
 def test_live_two_bay_sensor_events_assignment_and_health():
+    reset_default_lot()
     headers = {"x-device-token": "change-device-token-in-production"}
     assert client.get("/api/bays").status_code == 200
     initial = client.get("/api/bays").json()["bays"]
@@ -101,10 +112,40 @@ def test_live_two_bay_sensor_events_assignment_and_health():
 
 
 def test_live_bay_assignment_requires_free_sensor_state():
+    reset_default_lot()
     headers = {"x-device-token": "change-device-token-in-production"}
     payload = {"event_id": "live-bay-occupied-002", "device_id": "pi-live", "sensor_id": "L2", "space_id": "L2", "event_type": "bay_occupied"}
     assert client.post("/api/iot/events", headers=headers, json=payload).status_code == 200
     assert client.post("/api/bays/L2/assignment", json={"assigned": True}).status_code == 409
+
+
+def test_sensor_free_after_assignment_keeps_marker_and_occupied_overrides():
+    reset_default_lot()
+    headers = {"x-device-token": "change-device-token-in-production"}
+    free = {"event_id": "assigned-free-event-01", "device_id": "pi-assignment", "sensor_id": "L1", "space_id": "L1", "event_type": "bay_free"}
+    assert client.post("/api/iot/events", headers=headers, json=free).status_code == 200
+    assert client.post("/api/bays/L1/assignment", json={"assigned": True}).status_code == 200
+    assert client.post("/api/iot/events", headers=headers, json={**free, "event_id": "assigned-free-event-02"}).status_code == 200
+    l1 = next(bay for bay in client.get("/api/bays").json()["bays"] if bay["id"] == "L1")
+    assert l1["display_state"] == "ASSIGNED"
+    assert client.post("/api/iot/demo-events", json={**free, "event_id": "assigned-occupied-event-01", "event_type": "bay_occupied"}).status_code == 200
+    l1 = next(bay for bay in client.get("/api/bays").json()["bays"] if bay["id"] == "L1")
+    assert l1["display_state"] == "OCCUPIED"
+
+
+def test_public_passwordless_assignment_creates_billable_visitor_session():
+    reset_default_lot()
+    headers = {"x-device-token": "change-device-token-in-production"}
+    free = {"event_id": "public-assign-free-001", "device_id": "pi-public-assign", "sensor_id": "L1", "space_id": "L1", "event_type": "bay_free"}
+    assert client.post("/api/iot/events", headers=headers, json=free).status_code == 200
+    result = client.post("/api/public/assign-visitor-bay", json={"space_id": "L1"})
+    assert result.status_code == 200
+    assert result.json()["status"] == "ASSIGNED"
+    visitor_headers = {"x-visitor-token": result.json()["visitor_token"]}
+    assert client.get("/api/v1/visitor/me", headers=visitor_headers).json()["assignment"]["space_id"] == "L1"
+    occupied = {**free, "event_id": "public-assign-occupied-001", "event_type": "bay_occupied"}
+    assert client.post("/api/iot/events", headers=headers, json=occupied).status_code == 200
+    assert client.get("/api/v1/visitor/me", headers=visitor_headers).json()["status"] == "PARKED"
 
 
 def test_open_staff_interface_no_login_and_iot_still_requires_device_token():
@@ -133,6 +174,8 @@ def test_direct_staff_interface_and_public_sensor_availability():
     assert initial.status_code == 200
     assert [space["id"] for space in initial.json()["spaces"]] == ["L1", "L2"]
     assert client.get("/api/v1/admin/site").status_code == 200
+    assert client.get("/api/v1/admin/config").status_code == 200
+    assert client.get("/api/v1/admin/tariff").status_code == 200
     assert client.post("/api/v1/admin/login", json={"email": "anyone@example.test", "password": "unused"}).json()["access_token"] == "open-interface"
     main_module.OPEN_STAFF_INTERFACE = False
 

@@ -6,7 +6,7 @@ Smart Park is a single-facility, mobile-first parking PWA operated by ParkTech. 
 
 ```text
 src/                    React/Vite visitor PWA and security dashboard
-	App.tsx               Visitor, GPS, QR scanner, admin login, and dashboards
+	App.tsx               Visitor, GPS, QR scanner, open staff workspace, and dashboards
 	api.ts                Typed REST/WebSocket client
 	styles.css            Responsive visual system
 backend/app/main.py    FastAPI routes, SQLite models, auth, QR generation, WebSockets
@@ -64,7 +64,7 @@ Useful URLs:
 
 - Visitor PWA: `http://localhost:5173/visit?facility=default`
 - Admin portal: `http://localhost:5173/admin`
-- QR display: `http://localhost:5173/qr` (uses the active signed checkpoint URL)
+- QR display: `http://localhost:5173/qr` (visitor entry, no sign-in required)
 - Checkpoint QR setup and print: Admin **Settings** or Security **Checkpoint QR**
 - Printable poster: `http://localhost:5173/poster.html`
 - FastAPI docs: `http://localhost:8000/docs`
@@ -129,7 +129,7 @@ For phone testing, set `VITE_API_URL` to an HTTPS API URL reachable by the phone
 
 The PWA manifest is `/manifest.webmanifest`; `/sw.js` caches only public shell assets. API responses, assignments, and occupancy data are never cached as current truth.
 
-For a phone on the same network, bind both services to `0.0.0.0` and replace `localhost` with the computer's LAN IP. For camera and geolocation features, use HTTPS in production or an HTTPS tunnel during testing. A phone cannot reach the computer's `localhost`.
+For a phone or Pi on the same network, bind both services to `0.0.0.0`, set `VITE_API_URL=http://<computer-lan-ip>:8000`, and add `http://<computer-lan-ip>:5173` to `SMARTPARK_CORS_ORIGINS`. Restart Vite after changing `.env.local`. For camera and geolocation features, use HTTPS in production or an HTTPS tunnel during testing. A phone cannot reach the computer's `localhost`.
 
 ## IoT hardware module (Raspberry Pi 4)
 
@@ -153,10 +153,11 @@ Enter distances at the L1/L2 prompts. `60` represents occupied and `100` represe
 For a Pi and development computer on the same LAN:
 
 1. Find the computer's LAN IPv4 address with `ipconfig` (Windows) or `ip addr` (Linux), such as `192.168.1.20`.
-2. Start the backend bound to the LAN interface: `python -m uvicorn app.main:app --app-dir backend --host 0.0.0.0 --port 8000`.
-3. Set the web app's `VITE_API_URL=http://192.168.1.20:8000` in the root `.env.local`, then restart Vite with `npm run dev -- --host 0.0.0.0`.
-4. Allow inbound TCP port 8000 on the computer's private LAN firewall profile. Ensure both devices are on the same non-guest network and client isolation is disabled.
-5. On the Pi, set `SMARTPARK_API_URL=http://192.168.1.20:8000`, `SMARTPARK_DEVICE_ID`, and `SMARTPARK_DEVICE_TOKEN`. Install `requests` and `RPi.GPIO`, then run `python iot/sensor_agent.py`.
+2. In `backend/.env`, set `SMARTPARK_OPEN_STAFF_INTERFACE=true` and a long random `SMARTPARK_DEVICE_TOKEN`, then restart the backend: `python -m uvicorn app.main:app --app-dir backend --host 0.0.0.0 --port 8000`.
+3. Set `VITE_API_URL=http://192.168.1.20:8000` in the root `.env.local`, then restart Vite with `npm run dev -- --host 0.0.0.0`.
+4. Allow inbound TCP ports 8000 and 5173 on the computer's private LAN firewall profile. Ensure both devices are on the same non-guest network and client isolation is disabled.
+5. Open `http://192.168.1.20:5173/admin` on the computer or phone. Configure facility GPS under **Settings** and the tariff under **Pricing**.
+6. On the Pi, set `SMARTPARK_API_URL=http://192.168.1.20:8000`, `SMARTPARK_DEVICE_ID`, and the matching `SMARTPARK_DEVICE_TOKEN`. Install `requests` and `RPi.GPIO`, then run `python iot/sensor_agent.py`.
 
 The direct staff web interface intentionally has no login. Keep the development app and API on a trusted network; switch `SMARTPARK_OPEN_STAFF_INTERFACE=false` and deploy the existing account flow before exposing the service to an untrusted/public network. The Pi still uses a device token so public visitors cannot forge physical readings.
 

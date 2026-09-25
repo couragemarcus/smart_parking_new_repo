@@ -730,6 +730,36 @@ async def assign_anonymous_bay(assignment: VisitorBayAssignment) -> dict[str, An
     return {"status": "ASSIGNED", "space_id": assignment.space_id}
 
 
+@app.post("/api/public/assign-visitor-bay")
+async def assign_open_visitor_bay(assignment: VisitorBayAssignment, request: Request) -> dict[str, Any]:
+    """Create a private, passwordless visitor session and reserve one confirmed-free bay."""
+    enforce_session_rate_limit(request.client.host if request.client else "unknown")
+    with DB_LOCK, connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        sensor = db.execute("SELECT physical_state, last_seen FROM bay_sensor_state WHERE space_id = ?", (assignment.space_id,)).fetchone()
+        if not sensor or not sensor["last_seen"] or sensor["last_seen"] < (datetime.now(timezone.utc) - timedelta(seconds=10)).isoformat() or sensor["physical_state"] != "FREE":
+            raise HTTPException(409, "bay_not_confirmed_free")
+        bay = db.execute("SELECT status, assigned_session FROM parking_spaces WHERE id = ? AND site_id = ?", (assignment.space_id, SITE_ID)).fetchone()
+        if not bay or bay["status"] == "OCCUPIED":
+            raise HTTPException(409, "bay_not_available")
+        if bay["assigned_session"] not in (None, "OPEN_DEMO", "DEMO_DRIVER"):
+            raise HTTPException(409, "bay_already_assigned")
+        timestamp = now()
+        session_id, visitor_token = secrets.token_urlsafe(16), secrets.token_urlsafe(32)
+        expiry = (datetime.fromisoformat(timestamp) + timedelta(minutes=VISITOR_SESSION_MINUTES)).isoformat()
+        db.execute("INSERT INTO visitor_sessions(id, token_hash, site_id, status, created_at, expires_at) VALUES (?, ?, ?, 'ASSIGNED', ?, ?)", (session_id, token_hash(visitor_token), SITE_ID, timestamp, expiry))
+        db.execute("UPDATE parking_spaces SET status='RESERVED', assigned_session=?, updated_at=? WHERE id=?", (session_id, timestamp, assignment.space_id))
+        db.execute("UPDATE bay_sensor_state SET last_seen=? WHERE space_id=?", (timestamp, assignment.space_id))
+        reservation_id = secrets.token_urlsafe(12)
+        db.execute("UPDATE reservations SET status='EXPIRED' WHERE space_id=? AND status='RESERVED'", (assignment.space_id,))
+        db.execute("INSERT INTO reservations VALUES (?, ?, ?, 'RESERVED', ?, NULL, NULL)", (reservation_id, assignment.space_id, session_id, timestamp))
+        db.execute("UPDATE demo_bay_assignments SET active=0 WHERE space_id=? AND active=1", (assignment.space_id,))
+        audit(db, "visitor_bay_assigned", f"Visitor assigned confirmed-free bay {assignment.space_id}", assignment.space_id, session_id)
+    await manager.broadcast({"type": "bay_state_changed", "space_id": assignment.space_id})
+    await manager.broadcast({"type": "space_reserved", "space_id": assignment.space_id}, session_id)
+    return {"session_id": session_id, "visitor_token": visitor_token, "status": "ASSIGNED", "space_id": assignment.space_id}
+
+
 @app.post("/api/guard/arrivals/{session_id}/match")
 @app.post("/api/v1/security/arrivals/{session_id}/match")
 @app.post("/api/v1/security/arrivals/{session_id}/verify", include_in_schema=False)
@@ -1007,9 +1037,9 @@ def live_bays() -> list[dict[str, Any]]:
         rows = db.execute("""SELECT p.id, COALESCE(s.physical_state, 'UNKNOWN') AS physical_state,
             s.device_id, s.last_seen, s.updated_at AS sensor_updated_at,
             CASE WHEN s.last_seen IS NULL OR s.last_seen < ? THEN 'WAITING_FOR_SENSOR'
-                 WHEN p.status = 'OCCUPIED' THEN 'OCCUPIED'
-                 WHEN p.assigned_session IS NOT NULL AND COALESCE(s.physical_state, 'UNKNOWN') = 'FREE' THEN 'ASSIGNED'
                  WHEN s.physical_state = 'OCCUPIED' THEN 'OCCUPIED'
+                 WHEN p.status = 'OCCUPIED' AND COALESCE(s.physical_state, 'UNKNOWN') != 'FREE' THEN 'OCCUPIED'
+                 WHEN p.assigned_session IS NOT NULL AND COALESCE(s.physical_state, 'UNKNOWN') = 'FREE' THEN 'ASSIGNED'
                  ELSE 'AVAILABLE' END AS display_state,
             CASE WHEN p.assigned_session IS NOT NULL THEN 1 ELSE 0 END AS assigned
             FROM parking_spaces p LEFT JOIN bay_sensor_state s ON s.space_id = p.id
@@ -1032,10 +1062,10 @@ def public_live_availability() -> dict[str, Any]:
 @app.get("/api/public/facility-config")
 def public_facility_config() -> dict[str, Any]:
     with connect() as db:
-        row = db.execute("SELECT latitude, longitude FROM sites WHERE id = ?", (SITE_ID,)).fetchone()
+        row = db.execute("SELECT latitude, longitude, setup_complete FROM sites WHERE id = ?", (SITE_ID,)).fetchone()
     if not row:
         raise HTTPException(404, "site_not_found")
-    return {"site_id": SITE_ID, "latitude": row["latitude"], "longitude": row["longitude"]}
+    return {"site_id": SITE_ID, "latitude": row["latitude"] if row["setup_complete"] and (row["latitude"] != 0 or row["longitude"] != 0) else None, "longitude": row["longitude"] if row["setup_complete"] and (row["latitude"] != 0 or row["longitude"] != 0) else None}
 
 
 @app.post("/api/v1/security/bays/{space_id}/assignment")
@@ -1050,13 +1080,15 @@ async def set_bay_assignment(space_id: str, assignment: BayAssignment) -> dict[s
             existing = db.execute("SELECT assigned_session, status FROM parking_spaces WHERE id = ?", (space_id,)).fetchone()
             if existing["status"] == "OCCUPIED":
                 raise HTTPException(409, "bay_occupied")
-            if existing["assigned_session"] not in (None, "DEMO_DRIVER"):
+            if existing["assigned_session"] not in (None, "DEMO_DRIVER", "OPEN_DEMO"):
                 raise HTTPException(409, "bay_already_assigned")
             db.execute("UPDATE parking_spaces SET assigned_session = 'DEMO_DRIVER', status = 'RESERVED', updated_at = ? WHERE id = ?", (now(), space_id))
-            db.execute("INSERT INTO demo_bay_assignments(id, space_id, created_at, active) VALUES (?, ?, ?, 1) ON CONFLICT(id) DO NOTHING", (secrets.token_urlsafe(10), space_id, now()))
+            db.execute("UPDATE bay_sensor_state SET last_seen = ? WHERE space_id = ?", (now(), space_id))
+            db.execute("UPDATE demo_bay_assignments SET active = 0 WHERE space_id = ? AND active = 1", (space_id,))
+            db.execute("INSERT INTO demo_bay_assignments(id, space_id, created_at, active) VALUES (?, ?, ?, 1)", (secrets.token_urlsafe(10), space_id, now()))
         else:
             db.execute("UPDATE demo_bay_assignments SET active = 0 WHERE space_id = ? AND active = 1", (space_id,))
-            db.execute("UPDATE parking_spaces SET assigned_session = NULL, status = CASE WHEN (SELECT physical_state FROM bay_sensor_state WHERE space_id = ?) = 'OCCUPIED' THEN 'OCCUPIED' ELSE 'AVAILABLE' END, updated_at = ? WHERE id = ?", (space_id, now(), space_id))
+            db.execute("UPDATE parking_spaces SET assigned_session = NULL, status = CASE WHEN (SELECT physical_state FROM bay_sensor_state WHERE space_id = ?) = 'OCCUPIED' THEN 'OCCUPIED' ELSE 'AVAILABLE' END, updated_at = ? WHERE id = ? AND assigned_session IN ('DEMO_DRIVER','OPEN_DEMO')", (space_id, now(), space_id))
         audit(db, "bay_assignment", f"{space_id} {'assigned to demo driver' if assignment.assigned else 'assignment cleared'}", space_id)
     await manager.broadcast({"type": "bay_state_changed", "space_id": space_id})
     return next(bay for bay in live_bays() if bay["id"] == space_id)
@@ -1258,14 +1290,19 @@ async def live_iot_event(event: SensorEvent, authenticated_device: str | None = 
         raise HTTPException(403, "device_facility_mismatch")
     state = "OCCUPIED" if event.event_type.lower() == "bay_occupied" else "FREE"
     measured_at = event.measured_at or event.observed_at or now()
+    received_at = now()
+    billable_sessions: list[dict[str, str]] = []
     with DB_LOCK, connect() as db:
         if db.execute("SELECT 1 FROM iot_events WHERE event_id = ?", (event.event_id,)).fetchone():
             return {"status": "duplicate", "event_id": event.event_id}
         db.execute("INSERT INTO iot_events VALUES (?, ?, ?, ?, ?, ?, ?)", (event.event_id, event.device_id, event.sensor_id, "bay_" + state.lower(), event.space_id, measured_at, now()))
-        db.execute("INSERT INTO bay_sensor_state(space_id, physical_state, device_id, last_seen, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(space_id) DO UPDATE SET physical_state=excluded.physical_state, device_id=excluded.device_id, last_seen=excluded.last_seen, updated_at=excluded.updated_at", (event.space_id, state, event.device_id, now(), now()))
+        db.execute("INSERT INTO bay_sensor_state(space_id, physical_state, device_id, last_seen, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(space_id) DO UPDATE SET physical_state=excluded.physical_state, device_id=excluded.device_id, last_seen=excluded.last_seen, updated_at=excluded.updated_at", (event.space_id, state, event.device_id, received_at, received_at))
+        db.execute("UPDATE parking_spaces SET status='AVAILABLE' WHERE id=? AND site_id=? AND status='UNKNOWN' AND assigned_session IS NULL AND ?='FREE'", (event.space_id, SITE_ID, state))
+        if state == "FREE":
+            db.execute("UPDATE parking_spaces SET status = 'AVAILABLE' WHERE id = ? AND status IN ('UNKNOWN','AVAILABLE') AND assigned_session IS NULL", (event.space_id,))
         if state == "OCCUPIED":
             db.execute("UPDATE demo_bay_assignments SET active = 0 WHERE space_id = ? AND active = 1", (event.space_id,))
-            reservation = db.execute("SELECT * FROM reservations WHERE space_id = ? AND status = 'RESERVED' ORDER BY created_at DESC LIMIT 1", (event.space_id,)).fetchone()
+            reservation = db.execute("SELECT * FROM reservations WHERE space_id = ? AND status IN ('RESERVED', 'OCCUPIED') ORDER BY created_at DESC LIMIT 1", (event.space_id,)).fetchone()
             if not reservation:
                 db.execute("UPDATE demo_bay_assignments SET active = 0 WHERE space_id = ? AND active = 1", (event.space_id,))
                 db.execute("UPDATE parking_spaces SET status = 'OCCUPIED', assigned_session = NULL, updated_at = ? WHERE id = ?", (measured_at, event.space_id))
@@ -1274,20 +1311,27 @@ async def live_iot_event(event: SensorEvent, authenticated_device: str | None = 
             if reservation:
                 db.execute("UPDATE reservations SET status = 'OCCUPIED', occupied_at = COALESCE(occupied_at, ?) WHERE id = ?", (measured_at, reservation["id"]))
                 db.execute("UPDATE visitor_sessions SET status = 'PARKED' WHERE id = ?", (reservation["session_id"],))
+                billable_sessions.append({"session_id": reservation["session_id"], "space_id": event.space_id})
         else:
             reservation = db.execute("SELECT * FROM reservations WHERE space_id = ? AND status = 'EXIT_AUTHORIZED' ORDER BY created_at DESC LIMIT 1", (event.space_id,)).fetchone()
             if reservation:
-                db.execute("UPDATE bay_sensor_state SET physical_state='FREE', last_seen=?, updated_at=? WHERE space_id=?", (measured_at, measured_at, event.space_id))
+                db.execute("UPDATE bay_sensor_state SET physical_state='FREE', last_seen=?, updated_at=? WHERE space_id=?", (received_at, received_at, event.space_id))
                 db.execute("UPDATE reservations SET status = 'RELEASED', released_at = ? WHERE id = ?", (measured_at, reservation["id"]))
                 db.execute("UPDATE visitor_sessions SET status = 'CLOSED' WHERE id = ?", (reservation["session_id"],))
                 db.execute("UPDATE parking_spaces SET status = 'AVAILABLE', assigned_session = NULL, vehicle_id = NULL, updated_at = ? WHERE id = ?", (measured_at, event.space_id))
             else:
-                db.execute("UPDATE bay_sensor_state SET physical_state='FREE', last_seen=?, updated_at=? WHERE space_id=?", (measured_at, measured_at, event.space_id))
-                db.execute("UPDATE demo_bay_assignments SET active = 0 WHERE space_id = ? AND active = 1", (event.space_id,))
-                db.execute("UPDATE parking_spaces SET status = 'AVAILABLE', assigned_session = NULL WHERE id = ?", (event.space_id,))
-                db.execute("UPDATE parking_spaces SET updated_at = ? WHERE id = ?", (measured_at, event.space_id))
+                occupying = db.execute("SELECT * FROM reservations WHERE space_id = ? AND status = 'OCCUPIED' ORDER BY created_at DESC LIMIT 1", (event.space_id,)).fetchone()
+                db.execute("UPDATE bay_sensor_state SET physical_state='FREE', last_seen=?, updated_at=? WHERE space_id=?", (received_at, received_at, event.space_id))
+                if occupying:
+                    # A vacancy never ends a billable session. Keep it parked until staff logs payment and authorizes exit.
+                    db.execute("UPDATE parking_spaces SET status='OCCUPIED', updated_at=? WHERE id=?", (measured_at, event.space_id))
+                else:
+                    db.execute("UPDATE demo_bay_assignments SET active = 0 WHERE space_id = ? AND active = 1", (event.space_id,))
+                    db.execute("UPDATE parking_spaces SET status = CASE WHEN assigned_session IN ('OPEN_DEMO','DEMO_DRIVER') THEN 'RESERVED' ELSE 'AVAILABLE' END, assigned_session = CASE WHEN assigned_session IN ('OPEN_DEMO','DEMO_DRIVER') THEN assigned_session ELSE NULL END, updated_at = ? WHERE id = ?", (measured_at, event.space_id))
         audit(db, "bay_" + state.lower(), f"{event.space_id} physical state is {state}", event.space_id)
     await manager.broadcast({"type": "bay_state_changed", "space_id": event.space_id, "physical_state": state})
+    for session in billable_sessions:
+        await manager.broadcast({"type": "parking_started", "space_id": session["space_id"]}, session["session_id"])
     return {"status": "processed", "event_id": event.event_id}
 
 
@@ -1318,7 +1362,7 @@ async def live_iot_demo_event(event: SensorEvent) -> dict[str, Any]:
                 db.execute("UPDATE parking_spaces SET status = 'AVAILABLE', assigned_session = NULL, vehicle_id = NULL, updated_at = ? WHERE id = ?", (measured_at, event.space_id))
             else:
                 db.execute("UPDATE demo_bay_assignments SET active = 0 WHERE space_id = ? AND active = 1", (event.space_id,))
-                db.execute("UPDATE parking_spaces SET status = 'AVAILABLE', assigned_session = NULL, updated_at = ? WHERE id = ?", (measured_at, event.space_id))
+                db.execute("UPDATE parking_spaces SET status = CASE WHEN assigned_session = 'OPEN_DEMO' THEN 'RESERVED' ELSE 'AVAILABLE' END, assigned_session = CASE WHEN assigned_session = 'OPEN_DEMO' THEN 'OPEN_DEMO' ELSE NULL END, updated_at = ? WHERE id = ?", (measured_at, event.space_id))
         audit(db, "bay_" + state.lower(), f"Demo sensor: {event.space_id} is {state}", event.space_id)
     await manager.broadcast({"type": "bay_state_changed", "space_id": event.space_id, "physical_state": state})
     return {"status": "processed", "event_id": event.event_id}

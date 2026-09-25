@@ -219,11 +219,7 @@ function App() {
         try { await refreshBackendState(token) }
         catch { window.localStorage.removeItem('smartpark.visitor.token'); window.localStorage.removeItem('smartpark.visitor.token.expires'); token = null }
       }
-      if (token) {
-        setVisitorToken(token)
-        socket = visitorSocket(token)
-        if (socket) socket.onmessage = () => { if (token) void refreshBackendState(token) }
-      } else if (backendEnabled) {
+      if (!token && backendEnabled) {
         try {
           const session = await createVisitorSession(entrySiteId, checkpointToken || undefined)
           token = session.visitor_token
@@ -233,6 +229,11 @@ function App() {
           socket = visitorSocket(token)
           if (socket) socket.onmessage = () => { void refreshBackendState(token!) }
         } catch { setVisitorToken(null) }
+      }
+      if (token) {
+        setVisitorToken(token)
+        socket = visitorSocket(token)
+        if (socket) socket.onmessage = () => { void refreshBackendState(token!) }
       } else setVisitorToken(null)
     }
     void bootstrap().catch((error) => setCheckpointError(error instanceof Error ? `This entrance QR is invalid or revoked. Ask ParkTech staff for the current checkpoint QR. (${error.message})` : 'This entrance QR is invalid or revoked. Ask ParkTech staff for the current checkpoint QR.'))
