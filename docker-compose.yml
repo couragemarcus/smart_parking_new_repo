@@ -1,0 +1,21 @@
+services:
+  api:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./backend/.env
+    volumes:
+      - smartpark-data:/app/data
+  postgres:
+    image: postgres:16-alpine
+    profiles: [production]
+    environment:
+      POSTGRES_DB: smartpark
+      POSTGRES_USER: smartpark
+      POSTGRES_PASSWORD: smartpark
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+volumes:
+  smartpark-data:
+  postgres-data:

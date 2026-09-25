@@ -1,0 +1,14 @@
+{
+  "name": "Smart Park",
+  "short_name": "Smart Park",
+  "description": "Find, reserve, and navigate to ParkTech parking.",
+  "start_url": "/visit/default",
+  "scope": "/",
+  "display": "standalone",
+  "theme_color": "#142538",
+  "background_color": "#f4f8fd",
+  "icons": [
+    { "src": "/icons/icon-192.svg", "sizes": "192x192", "type": "image/svg+xml", "purpose": "any maskable" },
+    { "src": "/icons/icon-512.svg", "sizes": "512x512", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
